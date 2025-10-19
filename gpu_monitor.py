@@ -1,4 +1,4 @@
-# intel_arc_monitor_with_beep.py
+# intel_arc_monitor_with_beep.py - 核心功能: 持续监控 VRAM 使用情况，确保 Webui 等任务持续运行
 
 import tkinter as tk
 import time
@@ -9,6 +9,7 @@ from just_playback import Playback
 import platform
 from loguru import logger
 import winsound
+# import random # <-- [移除] 不再需要模拟数据
 
 # --- Loguru 配置 (完美的日志输出) ---
 logger.remove()
@@ -22,7 +23,14 @@ class IntelArcMonitorApp:
     Intel Arc A770 实时监控应用程序，使用系统命令行工具获取GPU信息，
     并用tkinter显示和警报，现已增强数据条和颜色警报功能。
     
-    数据顺序：CPU -> 物理内存 -> 虚拟内存 -> GPU 利用率 -> 专有显存 -> 下载速度 -> 上传速度
+    数据顺序：CPU -> 物理内存 -> 虚拟内存 -> GPU 性能占用 -> 专有显存 -> 下载速度 -> 上传速度
+    
+    【程序核心功能】
+    ------------------------------------------------------------------------------------
+    核心目标: 持续监控专有显存（VRAM）使用情况，当其低于设定阈值（VRAM < 8GB）时，
+    通过声音和UI进行警报，以确认Webui等任务是否意外中断。
+    次要功能: 监控虚拟内存（VM）使用量，超过 80GB 时给出橙色风险提示，并周期性记录其增长量。
+    ------------------------------------------------------------------------------------
     """
     
     # 显存警告阈值：8GB (转换为Bytes)
@@ -31,8 +39,8 @@ class IntelArcMonitorApp:
     
     # 连续警报次数阈值 (用于实现警报延迟触发)
     WARN_COUNT_THRESHOLD = 7
-
-    # 虚拟内存警报阈值：80GB (如果低于 80GB 则警报 / 如果高于 80GB 则提示风险)
+    
+    # 虚拟内存风险提醒阈值：80GB (仅用于橙色提醒，不触发铃声警报)
     VIRTUAL_MEMORY_WARN_THRESHOLD_GB = 80
     VIRTUAL_MEMORY_WARN_THRESHOLD_BYTES = VIRTUAL_MEMORY_WARN_THRESHOLD_GB * 1024**3
 
@@ -56,7 +64,7 @@ class IntelArcMonitorApp:
         self.master = master
         master.title("Intel Arc A770 实时监控 (数据条增强)")
         # 增大窗口以容纳数据条
-        master.geometry("450x450") 
+        master.geometry("450x550") 
         
         self.os_type = platform.system()
         if self.os_type != "Windows":
@@ -70,6 +78,19 @@ class IntelArcMonitorApp:
         self.is_alarm_active = False 
         # 连续触发警报条件的次数计数器
         self.consecutive_warn_count = 0
+        
+        # 【新增】：正式报警开始时间（首次播放时间）
+        self.alarm_start_time = None 
+        # 【新增】：歌曲循环播放次数计数器
+        self.playback_count = 0 
+        
+        # --- 周期性 VM 记录变量 ---
+        # 第一次记录
+        self.first_vm_record_time = None
+        self.first_vm_used_gb = None
+        # 上次记录
+        self.last_vm_record_time = None
+        self.last_vm_used_gb = None
         
         # --- 新增网络状态追踪变量 ---
         self.last_net_bytes_sent = 0
@@ -155,8 +176,8 @@ class IntelArcMonitorApp:
         self.shared_memory_label.pack(fill='x', padx=10, pady=(10, 0))
         self._setup_progress_bar('vram_system')
         
-        # 4. GPU Copy 性能占用
-        self.utilization_label = tk.Label(self.master, text="GPU Copy 性能占用: N/A", font=('Arial', 14), anchor='w')
+        # 4. GPU 性能占用 (改为通用性能)
+        self.utilization_label = tk.Label(self.master, text="GPU 性能占用: N/A", font=('Arial', 14), anchor='w')
         self.utilization_label.pack(fill='x', padx=10, pady=(10, 0))
         self._setup_progress_bar('gpu_util')
 
@@ -212,7 +233,6 @@ class IntelArcMonitorApp:
     def _get_system_stats_psutil(self):
         """
         使用 psutil 库获取系统 CPU、物理内存和虚拟内存数据及其占用百分比。
-        *重构优化点 (难度系数: 3/10):* 修复虚拟内存（已提交）的计算逻辑，使用 PowerShell 准确获取 Commit Charge。
         """
         try:
             # 获取 CPU 利用率 (非阻塞)
@@ -251,21 +271,23 @@ class IntelArcMonitorApp:
     def _get_gpu_stats_windows(self):
         """
         [Windows 平台专用]
-        通过 PowerShell 性能计数器获取 GPU **复制(Copy)性能占用**和专有显存占用。
+        通过 PowerShell 性能计数器获取 GPU **综合性能占用**和专有显存占用。
         
-        *重构优化点 (难度系数: 1/10):* 将 GPU 综合利用率替换为 GPU Copy 性能占用。
+        【注意】：GPU 性能占用已改为获取所有 GPU 引擎的平均利用率，以匹配任务管理器的大纲性能。
         """
         if self.os_type != "Windows":
             raise NotImplementedError("非 Windows 操作系统，无法执行 PowerShell 命令。")
             
         try:
-            # --- 1. 获取 GPU 复制(Copy)性能占用 ---
-            # 获取 GPU 复制(Copy)引擎的平均利用率 (替换为Copy性能)
-            # 注意：如果路径不匹配，请根据 PowerShell 'Get-Counter "\GPU Engine(*)\Utilization Percentage"' 的输出手动调整 engtype_copy_* 部分
-            util_cmd = r'powershell -ExecutionPolicy Bypass -Command "((Get-Counter \"\GPU Engine(engtype_copy_*)\Utilization Percentage\").CounterSamples | Select-Object -ExpandProperty CookedValue | Measure-Object -Average).Average"'
+            # --- 1. 获取 GPU 综合性能占用 (接近任务管理器大纲值) ---
+            # 命令：获取所有 GPU 引擎的平均利用率 (3D, Compute, Copy, etc.)
+            util_cmd = r'powershell -ExecutionPolicy Bypass -Command "((Get-Counter \"\GPU Engine(*)\Utilization Percentage\").CounterSamples | Select-Object -ExpandProperty CookedValue | Measure-Object -Average).Average"'
             result = subprocess.run(util_cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            
             # 使用 or 0.0 处理 PowerShell 偶尔返回空值的情况
             gpu_util = float(result.stdout.strip() or 0.0) 
+            
+            logger.debug(f"GPU Util (实际值): {gpu_util:.2f}%")
             
             # --- 2. 获取 专有显存占用 (Local Usage) ---
             mem_cmd = r'powershell -ExecutionPolicy Bypass -Command "((Get-Counter \"\GPU Process Memory(*)\Local Usage\").CounterSamples | Select-Object -ExpandProperty CookedValue | Measure-Object -Sum).Sum"'
@@ -282,17 +304,22 @@ class IntelArcMonitorApp:
 
         except subprocess.CalledProcessError as e:
             logger.error(f"PowerShell 命令执行失败，错误代码: {e.returncode}，输出: {e.stderr.strip()}")
-            raise RuntimeError("无法通过 PowerShell 获取 GPU 数据。请检查系统权限。")
+            # 警告用户需要手动检查性能计数器路径，但此处不中断程序，允许 VM/VRAM 继续工作
+            logger.warning("无法获取 GPU 性能计数器。请检查 PowerShell 命令和权限。")
+            # 失败时返回 0 或 None，避免程序崩溃
+            return 0.0, 0.0, 16 * 1024**3, 0.0 # 返回 0.0% 和默认总显存
         except Exception as e:
             logger.error(f"获取 GPU 数据时发生未知错误: {e}")
-            raise RuntimeError("未知错误：无法获取 GPU 数据。")
+            return 0.0, 0.0, 16 * 1024**3, 0.0
 
 
     def _play_beep_alarm(self):
         """
         播放自定义 WAV 文件（使用 just_playback）作为警报。
         """
-        logger.info("尝试播放声音警报...")
+        # 【新增】：记录并打印本次播放是第几次循环
+        self.playback_count += 1
+        logger.info(f"尝试播放声音警报 (第 {self.playback_count} 次循环)...")
         if self.os_type == "Windows":
             if self.playback:
                 try:
@@ -302,7 +329,8 @@ class IntelArcMonitorApp:
                     
                     # 重置播放位置到文件开头，确保每次都完整播放
                     self.playback.seek(0) 
-                    self.playback.play() # 播放预加载的文件 (非阻塞)
+                    # 播放预加载的文件 (非阻塞，恢复单次播放)
+                    self.playback.play()
                 except Exception as e:
                     logger.error(f"播放自定义声音文件 '{self.ALARM_WAV_FILE}' 失败（just_playback）：{e}。")
                     # 播放失败时，回退到系统警报音
@@ -333,13 +361,46 @@ class IntelArcMonitorApp:
         # 更新填充条的宽度和背景色
         fill_bar.place(width=new_width)
         fill_bar.config(bg=color)
+        
+    def _log_vm_usage_periodically(self, current_time, vram_system_used_gb):
+        """
+        周期性记录虚拟内存（VM）使用量和增量。每 30 分钟记录一次。
+        """
+        
+        # 第一次运行时记录初始值
+        if self.first_vm_record_time is None:
+            self.first_vm_record_time = current_time
+            self.first_vm_used_gb = vram_system_used_gb
+            self.last_vm_record_time = current_time
+            self.last_vm_used_gb = vram_system_used_gb
+            
+            log_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))
+            logger.info("--- 虚拟内存 (VM) 周期记录启动 ---")
+            # 控制台写清楚年月日时分秒多少虚拟内存大小
+            logger.info(f"【首次记录】{log_time_str} | VM 大小: {vram_system_used_gb:.1f} GB")
+            return
+
+        # 检查是否已经过了 30 分钟 (1800 秒)
+        time_since_last_record = current_time - self.last_vm_record_time
+        
+        # 考虑到 UPDATE_INTERVAL_MS = 1.5秒，允许一定的浮动
+        if time_since_last_record >= 1800 - 1.0: 
+            # 计算增加量
+            increase_gb = vram_system_used_gb - self.last_vm_used_gb
+            
+            log_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))
+            
+            # 打印日志 (年月日时分秒多少虚拟内存大小，增加量)
+            logger.info(f"【周期记录】{log_time_str} | VM 大小: {vram_system_used_gb:.1f} GB | 增加量: {increase_gb:.1f} GB (相比上次记录)")
+            
+            # 更新上次记录值
+            self.last_vm_record_time = current_time
+            self.last_vm_used_gb = vram_system_used_gb
 
 
     def update_gpu_info(self):
         """
         获取GPU和系统信息，更新界面数据和进度条，并检查警报条件。
-        
-        *重构优化点 (难度系数: 3/10):* 新增网络传输速度监控。
         """
         
         self.total_checks += 1
@@ -347,7 +408,7 @@ class IntelArcMonitorApp:
         current_time = time.time()
         
         try:
-            # --- 1. 获取 GPU 专有数据 (现为 Copy Engine 性能) ---
+            # --- 1. 获取 GPU 专有数据 (现为综合性能) ---
             gpu_util, mem_used_bytes, mem_total_bytes, vram_local_percent = self._get_gpu_stats_windows()
 
             # --- 2. 获取 系统数据 ---
@@ -360,6 +421,9 @@ class IntelArcMonitorApp:
             
             time_diff = current_time - self.last_update_time
             
+            # 最大的预期带宽（例如 1Gbps / 8 = 125 MB/s），用于进度条的百分比计算
+            MAX_BANDWIDTH_MBPS = 100 
+            
             # 首次运行时 time_diff 可能为 0 或接近 0，或者 last_bytes 为 0，不进行计算或避免除以零
             if time_diff > 0 and self.last_net_bytes_sent != 0:
                  # 计算下载和上传速度 (Bytes/秒)
@@ -370,9 +434,7 @@ class IntelArcMonitorApp:
                  recv_speed_mbps = recv_speed_bps / 1024**2
                  sent_speed_mbps = sent_speed_bps / 1024**2
                  
-                 # 最大的预期带宽（例如 1Gbps / 8 = 125 MB/s），用于进度条的百分比计算
-                 # 这里假设一个合理的上限 100 MB/s (800 Mbps)，以便在普通网络下进度条有变化
-                 MAX_BANDWIDTH_MBPS = 100 
+                 # 进度条的百分比计算
                  recv_percent = (recv_speed_mbps / MAX_BANDWIDTH_MBPS) * 100
                  sent_percent = (sent_speed_mbps / MAX_BANDWIDTH_MBPS) * 100
             else:
@@ -392,8 +454,11 @@ class IntelArcMonitorApp:
             mem_used_gb = mem_used_bytes / 1024**3
             mem_total_gb = mem_total_bytes / 1024**3
             
+            vram_system_used_gb = vram_system_used_bytes / 1024**3
+            vram_system_total_gb = vram_system_total_bytes / 1024**3
+            
             # =======================================================
-            # 更新数据和数据条 (按指定顺序：CPU, RAM, VRAM_SYS, GPU_UTIL, VRAM_LOCAL, NET_RECV, NET_SENT)
+            # 更新数据和数据条
             # =======================================================
             if cpu_percent is not None:
                  # 1. CPU 利用率
@@ -405,9 +470,6 @@ class IntelArcMonitorApp:
                  self._update_progress_bar('ram', ram_percent)
                  
                  # 3. 虚拟内存占用 (已提交/Committed)
-                 vram_system_used_gb = vram_system_used_bytes / 1024**3
-                 vram_system_total_gb = vram_system_total_bytes / 1024**3
-                 
                  # 计算百分比
                  vram_system_percent = (vram_system_used_bytes / vram_system_total_bytes) * 100 if vram_system_total_bytes > 0 else 0
                  
@@ -423,10 +485,10 @@ class IntelArcMonitorApp:
                  self._update_progress_bar('vram_system', 0)
                  # 确保警报逻辑不依赖 None
                  vram_system_used_bytes = 0
-                 vram_system_used_gb = 0
+                 vram_system_used_gb = 0 # 确保在 VM 记录时不会因为 None 报错
             
-            # 4. GPU 复制(Copy)性能占用
-            self.utilization_label.config(text=f"GPU Copy 性能占用: {gpu_util:.2f}%")
+            # 4. GPU 性能占用
+            self.utilization_label.config(text=f"GPU 性能占用: {gpu_util:.2f}%")
             self._update_progress_bar('gpu_util', gpu_util)
             
             # 5. 专有显存占用
@@ -443,35 +505,38 @@ class IntelArcMonitorApp:
             # 进度条使用 sent_percent，颜色使用 _get_color()
             self._update_progress_bar('net_sent', sent_percent)
             
-            # --- 检查警报条件 (逻辑组合) ---
+            # --- 检查警报条件 (仅 VRAM 触发铃声警报) ---
             
-            # 警报条件触发标志：Webui 中断警报 (专有显存 < 8GB 或 虚拟内存 < 80GB)
+            # 警报条件触发标志：Webui 中断警报 (仅 VRAM < 8GB)
             is_interrupt_warn_met = False
             vram_status_msg = ""
             vm_status_msg = ""
             
-            # 1. 专有显存 (VRAM) 警报: < 8GB 则中断警报
+            # 1. 专有显存 (VRAM) 警报: < 8GB 则中断警报 (触发铃声)
             if mem_used_bytes < self.MEMORY_WARN_THRESHOLD_BYTES: 
-                vram_status_msg = f"!!! Webui 可能已中断 !!! 专有显存: {mem_used_gb:.2f} GB (低于 {self.MEMORY_WARN_THRESHOLD_GB} GB)"
+                vram_status_msg = f"!!! 警报: VRAM {mem_used_gb:.2f} GB (低于 {self.MEMORY_WARN_THRESHOLD_GB} GB) !!!"
                 is_interrupt_warn_met = True
             # 专有显存 > 8GB，确认程序正常运行状态
             else:
-                vram_status_msg = f"专有显存: {mem_used_gb:.2f} GB (程序运行正常)"
-            
-            # 2. 虚拟内存 (Committed) 警报: < 80GB 则中断警报
-            if vram_system_used_bytes < self.VIRTUAL_MEMORY_WARN_THRESHOLD_BYTES: 
-                vm_status_msg = f"!!! Webui 可能已中断 !!! 虚拟内存: {vram_system_used_gb:.1f} GB (低于 {self.VIRTUAL_MEMORY_WARN_THRESHOLD_GB} GB)"
-                is_interrupt_warn_met = True
-            # 虚拟内存 >= 80GB，提示风险
+                vram_status_msg = f"VRAM 状态: 达标 ({mem_used_gb:.2f} GB)"
+
+            # 2. 虚拟内存 (Committed) 状态更新 (仅用于显示风险提醒，不触发铃声警报)
+            if vram_system_used_gb >= self.VIRTUAL_MEMORY_WARN_THRESHOLD_GB:
+                 # 风险提示 (橙色字符提醒)
+                 vm_status_msg = f"风险: VM {vram_system_used_gb:.1f} GB (高于 {self.VIRTUAL_MEMORY_WARN_THRESHOLD_GB} GB 存在爆内存风险!)"
+                 # 不设置 is_interrupt_warn_met = True，仅视觉提醒
             else:
-                 vm_status_msg = f"警告: 虚拟内存 {vram_system_used_gb:.1f} GB (可能会爆内存!)"
+                 # VM 正常提示
+                 vm_status_msg = f"VM 状态: 正常 ({vram_system_used_gb:.1f} GB)"
                 
             
             # --- 根据警报状态更新两个 Label ---
             if is_interrupt_warn_met:
-                # 触发中断警报时，两个 Label 都显示红色警报信息
+                # 触发 VRAM 中断警报时：所有警报相关的 Label 都显示红色
+                self.name_label.config(text="!!! 警报: Webui 可能已中断 !!!", fg="red")
                 self.status_vram_label.config(text=vram_status_msg, fg="red")
-                self.status_vm_label.config(text=vm_status_msg, fg="red")
+                # VM Label 在 VRAM 警报时也显示红色，强调风险，但警报触发是 VRAM 决定的
+                self.status_vm_label.config(text=vm_status_msg, fg="red") 
                 
                 # 【核心逻辑 1: 延迟触发】如果警报未激活，则累加计数器
                 if not self.is_alarm_active:
@@ -479,40 +544,62 @@ class IntelArcMonitorApp:
                     
                     # 如果连续计数达到阈值，则启动警报
                     if self.consecutive_warn_count >= self.WARN_COUNT_THRESHOLD:
+                        
+                        # 【新增】：记录正式报警开始时间
+                        if self.alarm_start_time is None:
+                             self.alarm_start_time = time.time()
+                             start_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.alarm_start_time))
+                             logger.critical(f"正式警报已启动！报警开始时间: {start_time_str}")
+                        
                         self.is_alarm_active = True
                         self.failure_count += 1
                         self.consecutive_warn_count = 0
                         self._play_beep_alarm()
-                        logger.critical(f"连续 {self.WARN_COUNT_THRESHOLD} 次检测到中断警报条件满足，警报音乐启动！")
                     else:
                          # 记录详细的警报信息
                          current_warn_parts = []
                          if mem_used_bytes < self.MEMORY_WARN_THRESHOLD_BYTES:
                               current_warn_parts.append("VRAM 低于 8GB")
-                         if vram_system_used_bytes < self.VIRTUAL_MEMORY_WARN_THRESHOLD_BYTES:
-                              current_warn_parts.append("VM 低于 80GB")
                          logger.warning(f"中断警报条件满足 ({', '.join(current_warn_parts)})，连续计数: {self.consecutive_warn_count}/{self.WARN_COUNT_THRESHOLD}。未达警报阈值。")
                          
-            else: # 警报条件不满足 (VRAM >= 8 GB 且 VM >= 80 GB)
+                # 【警报循环播放 Bug 逻辑】：如果警报已启动 (is_alarm_active=True)，但音乐已停止 (playback.active=False)，则重新启动音乐。
+                elif self.is_alarm_active and self.playback and not self.playback.active:
+                     # 播放计数和日志打印已在 _play_beep_alarm 内部处理
+                     self._play_beep_alarm()
+                         
+            else: # 警报条件不满足 (VRAM >= 8 GB)
                 
-                # 第一行：专有显存状态 (VRAM >= 8 GB)
+                # 恢复标题颜色
+                self.name_label.config(text="GPU: Intel Arc A770 16GB", fg="black")
+
+                # 第一行：专有显存状态 (VRAM)
                 self.status_vram_label.config(text=vram_status_msg, fg="green")
                 
-                # 第二行：虚拟内存风险提示 (VM >= 80 GB)
-                if vram_system_used_bytes >= self.VIRTUAL_MEMORY_WARN_THRESHOLD_BYTES:
-                    # 风险提示
-                    self.status_vm_label.config(text=vm_status_msg, fg="orange")
+                # 第二行：虚拟内存状态 (VM) - 根据阈值设置颜色
+                if vram_system_used_gb >= self.VIRTUAL_MEMORY_WARN_THRESHOLD_GB:
+                     # VM 风险，橙色提醒
+                     self.status_vm_label.config(text=vm_status_msg, fg="orange")
                 else:
-                    # VM 正常提示
-                    self.status_vm_label.config(text=f"虚拟内存: {vram_system_used_gb:.1f} GB (正常)", fg="green")
+                     # VM 正常，恢复默认颜色或绿色
+                     self.status_vm_label.config(text=vm_status_msg, fg="SystemButtonFace") 
                 
-                
-                # 【核心逻辑 2: 立即停止】如果警报状态是 True，强制停止音乐
+                # 【核心逻辑 2: 立即停止】如果警报状态是 True，强制停止音乐 (解决警报循环 Bug)
                 if self.is_alarm_active:
                     self.is_alarm_active = False
+                    
+                    # 记录和重置警报计时器和播放次数
+                    if self.alarm_start_time is not None:
+                         # 计算持续时间
+                         duration = time.time() - self.alarm_start_time
+                         logger.critical(f"警报已解除。警报持续时间: {duration:.1f} 秒，歌曲循环播放总次数: {self.playback_count} 次。")
+                         self.alarm_start_time = None
+                         self.playback_count = 0
+                    
+                    # 警报解除时，停止播放器（包括循环播放的音乐）
                     if self.playback and self.playback.active:
                         self.playback.stop()
                         logger.info("中断警报条件解除，已强制停止警报音乐。")
+                        
                 
                 # 【核心逻辑 3: 状态重置】只要不满足警报条件，就重置连续计数器
                 if self.consecutive_warn_count > 0:
@@ -523,18 +610,22 @@ class IntelArcMonitorApp:
                 
                 # 记录正常日志
                 if cpu_percent is not None:
-                     log_msg = f"状态正常 | GPU Copy Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}% | Net Recv: {recv_speed_mbps:.2f} MB/s"
+                     log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}% | Net Recv: {recv_speed_mbps:.2f} MB/s"
                 else:
-                     log_msg = f"状态正常 | GPU Copy Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败"
+                     log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败"
                 logger.info(log_msg)
-
+                
+            # --- 周期性 VM 使用量记录 ---
+            if cpu_percent is not None:
+                 self._log_vm_usage_periodically(current_time, vram_system_used_gb)
 
         except Exception as e:
             error_msg = f"数据获取失败: {e}"
             logger.error(error_msg)
             # 在错误情况下，两个 Label 都显示错误信息
-            self.status_vram_label.config(text=f"错误: {error_msg}", fg="red")
-            self.status_vm_label.config(text="", fg="red")
+            self.status_vram_label.config(text=f"错误: VRAM 数据获取失败", fg="red")
+            self.status_vm_label.config(text=f"详细信息: {e}", fg="red")
+            self.name_label.config(text="!!! 致命错误: 数据获取中断 !!!", fg="red")
             self.failure_count += 1
         
         # 更新日志计数器
@@ -548,6 +639,10 @@ class IntelArcMonitorApp:
 if __name__ == '__main__':
     try:
         root = tk.Tk()
+        print("=" * 70)
+        print("程序核心功能: 持续监控 VRAM 使用情况，确保 Webui 等任务持续运行 (VRAM >= 8GB)。")
+        print("次要功能: 监控 VM 使用量，超过 80GB 时给出橙色风险提醒，并周期性记录其增长量。")
+        print("=" * 70)
         app = IntelArcMonitorApp(root)
         root.mainloop()
             
