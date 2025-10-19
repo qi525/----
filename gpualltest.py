@@ -26,6 +26,9 @@ ENGINE_TRANSLATIONS = {
     "DMA": "直接内存访问"
 }
 
+# 定义需要重点监控的核心引擎
+CORE_ENGINES_TO_MONITOR = ["3D", "Compute", "Copy"] 
+
 try:
     # 打开一个查询句柄
     QUERY_HANDLE = win32pdh.OpenQuery()
@@ -66,7 +69,7 @@ except Exception as e:
 # ----------------------------------------------------
 
 class GpuMonitorApp:
-    # 难度系数评估：4/10 -> 3/10 (重构后逻辑更清晰，降低到 3/10)
+    # 难度系数评估：2/10 (重构分段 3)
     
     # 将全局句柄作为类属性，方便在 on_closing 中访问和清理
     QUERY_HANDLE = QUERY_HANDLE 
@@ -128,18 +131,19 @@ class GpuMonitorApp:
         for widget in self.main_frame.winfo_children():
             widget.destroy()
 
-    # @@ -187,1 +187,55 @@
-    # ------------------- 重构分段 1/3: 核心数据提取优化与分离 (难度系数: 3/10) -------------------
+    # ------------------- 数据层：数据获取和解析 (难度系数: 3/10) -------------------
     @staticmethod
     def _get_gpu_utilization_data(query_handle, engine_counters):
         """
         核心数据收集和解析逻辑，与 UI 分离。
-        返回: (aggregated_utilization, process_tracker, total_utilization, success_count)
+        返回: (aggregated_utilization, process_tracker, total_utilization, success_count, core_engine_utilization)
         """
         aggregated_utilization = {}
         process_tracker = {}
         total_utilization = 0
         success_count = 0
+        # 用于存储核心引擎的汇总利用率
+        core_engine_utilization = {engine: 0 for engine in CORE_ENGINES_TO_MONITOR}
         
         # 核心步骤：收集新的性能数据
         win32pdh.CollectQueryData(query_handle)
@@ -175,7 +179,11 @@ class GpuMonitorApp:
                     # 1. 累加总利用率
                     aggregated_utilization[engine_type] = aggregated_utilization.get(engine_type, 0) + util_percent
                     
-                    # 2. 跟踪进程利用率
+                    # 2. 核心引擎提取 (复用点)
+                    if engine_type in CORE_ENGINES_TO_MONITOR:
+                        core_engine_utilization[engine_type] += util_percent
+                        
+                    # 3. 跟踪进程利用率
                     if engine_type not in process_tracker:
                         process_tracker[engine_type] = {}
                     # 累加同一 PID 对同一引擎的贡献
@@ -186,10 +194,107 @@ class GpuMonitorApp:
                 if hasattr(e, 'winerror') and e.winerror not in [win32pdh.PDH_NO_DATA, win32pdh.PDH_CALC_COUNTER_VALUE_FIRST]:
                     logger.warning(f"获取 {full_engine_key} 计数器值失败: {e}")
                     
-        return aggregated_utilization, process_tracker, total_utilization, success_count
+        return aggregated_utilization, process_tracker, total_utilization, success_count, core_engine_utilization
+
+    # ------------------- 视图层：核心引擎摘要渲染 (难度系数: 2/10) -------------------
+    def _render_core_engines_summary(self, core_engine_utilization):
+        """
+        在 UI 上方渲染核心引擎 (3D, Compute, Copy) 的汇总信息。
+        """
+        core_text = "核心引擎利用率 (3D/Compute/Copy): "
+        for engine in CORE_ENGINES_TO_MONITOR:
+            util = core_engine_utilization.get(engine, 0)
+            core_text += f"[{engine}: {util:>3d}%] "
+            
+        tk.Label(self.main_frame, 
+                 text=core_text, 
+                 font=("Consolas", 10, "bold"), 
+                 fg="blue", 
+                 anchor=tk.W).pack(fill=tk.X, pady=(0, 10))
+
+    # ------------------- 视图层：详细条形图渲染 (难度系数: 3/10) -------------------
+    def _render_utilization_bars(self, aggregated_utilization, process_tracker):
+        """
+        根据聚合的利用率数据，动态创建并渲染所有引擎的进度条和进程细分信息。
+        """
+        # 2. 引擎类型细分
+        # 按利用率降序排列累加后的引擎类型
+        sorted_types = sorted(aggregated_utilization.items(), key=lambda item: item[1], reverse=True)
         
+        display_text_detail = "" # 用于控制台输出的详细信息
+        active_engine_types = 0
+        
+        for engine_type, total_util in sorted_types:
+            if total_util == 0:
+                continue
+            
+            active_engine_types += 1
+            
+            # 获取中文翻译
+            cn_name = ENGINE_TRANSLATIONS.get(engine_type, engine_type)
+            
+            # 确定进度条样式 (50%以下绿色，50-75%橙色，75-100%红色)
+            if total_util <= 50:
+                style_name = "Green.Horizontal.TProgressbar"
+            elif total_util <= 75:
+                style_name = "Orange.Horizontal.TProgressbar"
+            else:
+                style_name = "Red.Horizontal.TProgressbar"
+
+            # 容器：用于放置引擎名称、百分比和进度条
+            engine_frame = ttk.Frame(self.main_frame)
+            engine_frame.pack(fill=tk.X, pady=2)
+            
+            # 引擎名称和利用率标签
+            tk.Label(engine_frame, 
+                     text=f"[{cn_name} ({engine_type})]: {total_util:>3d}%",
+                     font=("Consolas", 10), 
+                     width=50, # 固定宽度以对齐
+                     anchor=tk.W).pack(side=tk.LEFT)
+            
+            # 进度条
+            progressbar = ttk.Progressbar(engine_frame, 
+                                          orient="horizontal", 
+                                          length=200, 
+                                          mode="determinate",
+                                          style=style_name)
+            progressbar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+            progressbar['value'] = min(total_util, 100) # 确保不超过100
+            
+            # 进程细分（显示到主框架，或折叠在子框架）
+            process_label_frame = ttk.Frame(self.main_frame)
+            process_label_frame.pack(fill=tk.X, padx=20)
+            
+            # 显示贡献最大的前三个进程
+            valid_pids = {p: u for p, u in process_tracker[engine_type].items() if u > 0}
+            sorted_pids = sorted(valid_pids.items(), key=lambda item: item[1], reverse=True)[:3]
+            
+            process_info = ""
+            for pid, util in sorted_pids:
+                # 去掉 pid_ 前缀
+                pid_num = pid.replace('pid_', '')
+                process_info += f"| PID {pid_num:<6}: {util:>3d}% "
+            
+            if process_info:
+                tk.Label(process_label_frame, 
+                         text=f"  {process_info}", 
+                         font=("Consolas", 8), 
+                         fg="gray", 
+                         anchor=tk.W).pack(fill=tk.X)
+            
+            # 同时构建控制台输出文本 (保留原有日志)
+            display_text_detail += f"\n [{cn_name} ({engine_type})]: {total_util:>3d}%\n"
+            for pid, util in sorted_pids:
+                pid_num = pid.replace('pid_', '')
+                display_text_detail += f"     - PID {pid_num:<6}: {util:>3d}%\n"
+                
+        return display_text_detail.strip(), active_engine_types
+    
+    
     def update_gpu_data(self):
-        """定时获取并更新 GPU 引擎数据"""
+        """
+        核心控制器：定时获取并更新 GPU 引擎数据
+        """
         
         if not PDH_AVAILABLE:
             self.master.after(1000, self.update_gpu_data)
@@ -201,97 +306,43 @@ class GpuMonitorApp:
         total_engines_count = len(self.ENGINE_COUNTERS)
 
         try:
-            # 调用分离后的数据收集方法
-            aggregated_utilization, process_tracker, total_utilization, success_count = \
+            # 1. 调用数据层方法获取所有数据
+            aggregated_utilization, process_tracker, total_utilization, success_count, core_engine_utilization = \
                 self._get_gpu_utilization_data(self.QUERY_HANDLE, self.ENGINE_COUNTERS)
-            
-            # 格式化输出到控制台（保留原有控制台输出）
-            
-            display_text = ""
             
             # 输出综合性能指标 (上限设为100%以防误导)
             total_util_capped = min(total_utilization, 100)
             
-            # ------------------- 可视化输出到 Tkinter --------------------
+            # ------------------- UI 渲染调用 --------------------
             
             # 1. 总体利用率标题
             tk.Label(self.main_frame, 
                      text=f"--- GPU 综合利用率 (核心引擎近似求和): {total_util_capped:>3d}% ---", 
                      font=("Consolas", 10, "bold"), 
                      anchor=tk.W).pack(fill=tk.X, pady=(0, 5))
+                     
+            # 2. 调用核心引擎汇总渲染方法
+            self._render_core_engines_summary(core_engine_utilization)
             
-            # 2. 引擎类型细分
-            # 按利用率降序排列累加后的引擎类型
-            sorted_types = sorted(aggregated_utilization.items(), key=lambda item: item[1], reverse=True)
+            # 3. 详细信息标题
+            tk.Label(self.main_frame, 
+                     text="--- 详细引擎类型细分 (含可视化条) ---", 
+                     font=("Consolas", 10, "bold"), 
+                     anchor=tk.W).pack(fill=tk.X, pady=(5, 5))
+                     
+            # 4. 调用抽象后的详细渲染方法
+            display_text_detail, active_engine_types = self._render_utilization_bars(aggregated_utilization, process_tracker)
             
-            active_engine_types = 0
+            # ------------------- 控制台输出 (聚合) --------------------
+            # 构造核心引擎信息用于控制台输出
+            core_engine_info = f"--- 核心引擎 (3D, Compute, Copy) 提取结果 ---\n"
+            for engine, util in core_engine_utilization.items():
+                core_engine_info += f"[{engine}]: {util:>3d}% "
+            core_engine_info += "\n"
             
-            for engine_type, total_util in sorted_types:
-                if total_util == 0:
-                    continue
-                
-                active_engine_types += 1
-                
-                # 获取中文翻译
-                cn_name = ENGINE_TRANSLATIONS.get(engine_type, engine_type)
-                
-                # 确定进度条样式
-                if total_util <= 50:
-                    style_name = "Green.Horizontal.TProgressbar"
-                elif total_util <= 75:
-                    style_name = "Orange.Horizontal.TProgressbar"
-                else:
-                    style_name = "Red.Horizontal.TProgressbar"
-
-                # 容器：用于放置引擎名称、百分比和进度条
-                engine_frame = ttk.Frame(self.main_frame)
-                engine_frame.pack(fill=tk.X, pady=2)
-                
-                # 引擎名称和利用率标签
-                tk.Label(engine_frame, 
-                         text=f"[{cn_name} ({engine_type})]: {total_util:>3d}%",
-                         font=("Consolas", 10), 
-                         width=50, # 固定宽度以对齐
-                         anchor=tk.W).pack(side=tk.LEFT)
-                
-                # 进度条
-                progressbar = ttk.Progressbar(engine_frame, 
-                                              orient="horizontal", 
-                                              length=200, 
-                                              mode="determinate",
-                                              style=style_name)
-                progressbar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
-                progressbar['value'] = min(total_util, 100) # 确保不超过100
-                
-                # 进程细分（显示到主框架，或折叠在子框架）
-                process_label_frame = ttk.Frame(self.main_frame)
-                process_label_frame.pack(fill=tk.X, padx=20)
-                
-                # 显示贡献最大的前三个进程
-                valid_pids = {p: u for p, u in process_tracker[engine_type].items() if u > 0}
-                sorted_pids = sorted(valid_pids.items(), key=lambda item: item[1], reverse=True)[:3]
-                
-                process_info = ""
-                for pid, util in sorted_pids:
-                    # 去掉 pid_ 前缀
-                    pid_num = pid.replace('pid_', '')
-                    process_info += f"| PID {pid_num:<6}: {util:>3d}% "
-                
-                if process_info:
-                    tk.Label(process_label_frame, 
-                             text=f"  {process_info}", 
-                             font=("Consolas", 8), 
-                             fg="gray", 
-                             anchor=tk.W).pack(fill=tk.X)
-                
-                # 同时构建控制台输出文本 (保留原有日志)
-                display_text += f"\n [{cn_name} ({engine_type})]: {total_util:>3d}%\n"
-                for pid, util in sorted_pids:
-                    pid_num = pid.replace('pid_', '')
-                    display_text += f"     - PID {pid_num:<6}: {util:>3d}%\n"
-
-
-            # *********** 将数据打印到控制台 ***********
+            print("\n" + core_engine_info)
+            display_text = core_engine_info + "\n" + display_text_detail # 聚合核心信息和详细信息
+            
             print(f"\n--- GPU 综合利用率 (核心引擎近似求和): {total_util_capped:>3d}% ---\n")
             print(display_text.strip() + "\n")
             # ******************************************************
