@@ -12,6 +12,8 @@ import datetime # <-- 【新增】用于获取实时时间
 import winsound
 # 【新增】引入线程池模块，用于后台数据采集
 import concurrent.futures 
+# 【新增】引入 os 模块，用于文件系统操作和计数
+import os # <-- ADDED
 
 # --- Loguru 配置 (完美的日志输出) ---
 logger.remove()
@@ -29,8 +31,12 @@ class IntelArcMonitorApp:
     
     【程序核心功能】
     ------------------------------------------------------------------------------------
-    核心目标: 持续监控专有显存（VRAM）使用情况，当其低于设定阈值（VRAM < 8GB）时，
+    核心目标 1: 持续监控专有显存（VRAM）使用情况，当其低于设定阈值（VRAM < 8GB）时，
     通过声音和UI进行警报，以确认Webui等任务是否意外中断。
+    
+    核心目标 2: 持续监控 Webui 输出目录文件数量，当其在设定周期内（默认 30 秒）
+    没有增加时，触发警报，以确认 Webui 生成任务是否中断。
+    
     次要功能: 监控虚拟内存（VM）使用量，超过 80GB 时给出橙色风险提示，并周期性记录其增长量。
     ------------------------------------------------------------------------------------
     """
@@ -68,8 +74,8 @@ class IntelArcMonitorApp:
         
         self.master = master
         master.title("Intel Arc A770 实时监控 (数据条增强)")
-        # 增大窗口以容纳数据条和时钟
-        master.geometry("450x580") 
+        # 增大窗口以容纳数据条、时钟和 Webui 状态
+        master.geometry("450x610") # <-- UPDATED SIZE
         
         self.os_type = platform.system()
         if self.os_type != "Windows":
@@ -101,6 +107,20 @@ class IntelArcMonitorApp:
         self.last_net_bytes_sent = 0
         self.last_net_bytes_recv = 0
         self.last_update_time = time.time() # 记录上次更新的时间戳，用于计算速度
+
+        # --- 【新增】Webui 文件监控追踪变量 (难度系数: 2) ---
+        # Webui 输出目录的基路径 (用户自定义路径)
+        self.WEBUI_OUTPUT_BASE_DIR = r'C:\stable-diffusion-webui\outputs\txt2img-images'
+        # 监测 Webui 文件数量的周期 (秒，用户要求 30 秒)
+        self.WEBUI_CHECK_INTERVAL_SECONDS = 30
+        
+        self.last_webui_check_time = time.time() # 上次检查 Webui 文件数量的时间
+        self.last_webui_file_count = -1 # 上次检查到的文件数量 (-1 为初始值)
+        # 连续周期内文件数量未增加的次数
+        self.consecutive_webui_no_increase_count = 0 
+        # 连续未增加文件数量的警报周期阈值 (连续 2 个 30 秒周期未增加，则警报)
+        self.WEBUI_WARN_CYCLE_THRESHOLD = 2 
+        # ----------------------------------------------------
 
         # 创建并配置tkinter界面
         self._setup_gui()
@@ -174,8 +194,8 @@ class IntelArcMonitorApp:
         """
         配置GUI界面元素，并按照指定顺序设置标签和数据条。
         """
-        # 调整窗口大小以容纳新增的两个网络指标和时钟
-        self.master.geometry("450x580")
+        # 调整窗口大小以容纳新增的两个网络指标、时钟和 Webui 状态标签
+        self.master.geometry("450x610") # <-- UPDATED SIZE
         
         # --- 新增：时钟标签 (1 秒刷新) ---
         self.clock_label = tk.Label(self.master, 
@@ -233,6 +253,10 @@ class IntelArcMonitorApp:
         # 第二行：虚拟内存风险提示
         self.status_vm_label = tk.Label(self.master, text="", font=('Arial', 12), fg="SystemButtonFace")
         self.status_vm_label.pack(pady=(0, 5)) # 下方留白
+        
+        # 第三行：【新增】Webui 任务状态提示
+        self.status_webui_label = tk.Label(self.master, text="", font=('Arial', 12, 'bold'), fg="SystemButtonFace")
+        self.status_webui_label.pack(pady=(5, 5)) # 上下方留白
 
         # 日志计数标签
         self.log_count_label = tk.Label(self.master, text="总次数: 0 | 正常: 0 | 警报触发: 0", font=('Arial', 10), anchor='w')
@@ -428,6 +452,105 @@ class IntelArcMonitorApp:
             self.last_vm_record_time = current_time
             self.last_vm_used_gb = vram_system_used_gb
 
+    def _count_files_in_output_dir(self):
+        """
+        【新增核心函数】
+        获取当天 Webui 输出目录的文件数量。
+        
+        原理：动态构建当天的目录路径，然后计算该目录下非目录文件的数量。
+        
+        返回: 文件数量 (int)，如果目录不存在或读取失败则返回 0。
+        """
+        try:
+            # 1. 获取当天日期的目录名 (格式: 2025-10-20)
+            today_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+            full_path = os.path.join(self.WEBUI_OUTPUT_BASE_DIR, today_date_str)
+            
+            if not os.path.exists(full_path):
+                # 目录不存在，Webui 可能未启动或今天未生成
+                return 0
+
+            # 2. 统计非目录文件的数量
+            file_count = 0
+            # 排除文件夹（目录）
+            for item in os.listdir(full_path):
+                 item_path = os.path.join(full_path, item)
+                 if os.path.isfile(item_path):
+                      file_count += 1
+                      
+            return file_count
+            
+        except Exception as e:
+            logger.error(f"统计 Webui 输出目录文件数量失败: {e}")
+            return 0 # 失败时返回 0，确保程序不中断
+
+    def _check_webui_generation_status(self, current_time):
+        """
+        【新增】检查 Webui 文件数量是否在周期内增加，用于判断生成任务是否中断。
+        此方法在后台线程中调用，并更新自身的追踪变量。
+        
+        返回: 
+            is_webui_alert_active (bool): True 表示文件数量持续未增加，警报阈值已达到。
+            webui_status_msg (str): 详细的状态信息。
+            current_file_count (int): 当前的文件数量。
+        """
+        
+        current_file_count = self._count_files_in_output_dir()
+        
+        # 首次运行时或上次数量为初始值 -1
+        if self.last_webui_file_count == -1:
+             self.last_webui_file_count = current_file_count
+             self.last_webui_check_time = current_time
+             logger.info(f"Webui 监控初始化：当前文件数 {current_file_count}。")
+             # 初始状态默认正常，不触发警报
+             return False, f"Webui 状态: 监控初始化完成 (文件数 {current_file_count})", current_file_count
+             
+        time_since_last_check = current_time - self.last_webui_check_time
+        
+        is_webui_alert_active = False
+        # 默认状态
+        webui_status_msg = f"Webui 状态: 正在生成 (文件数 {current_file_count})"
+        
+        # 检查是否达到一个完整的监测周期 (30秒)
+        # 允许 1.0 秒的误差
+        if time_since_last_check >= self.WEBUI_CHECK_INTERVAL_SECONDS - 1.0: 
+             
+             # 1. 判断文件数量是否增加
+             if current_file_count > self.last_webui_file_count:
+                  # 文件数量有增加，Webui 正在生成
+                  # 重置未增加计数器
+                  self.consecutive_webui_no_increase_count = 0
+                  logger.debug(f"Webui 状态: 文件数量增加 ({self.last_webui_file_count} -> {current_file_count})。")
+
+             elif current_file_count <= self.last_webui_file_count:
+                  # 文件数量没有增加或减少，可能中断
+                  self.consecutive_webui_no_increase_count += 1
+                  logger.warning(f"Webui 状态: 文件数量 {current_file_count} 未增加。连续未增加周期: {self.consecutive_webui_no_increase_count}/{self.WEBUI_WARN_CYCLE_THRESHOLD}")
+                  
+                  # 检查警报阈值
+                  if self.consecutive_webui_no_increase_count >= self.WEBUI_WARN_CYCLE_THRESHOLD:
+                       is_webui_alert_active = True
+                       webui_status_msg = f"!!! 警报: Webui 生成任务可能中断 (文件数 {current_file_count} 持续 {self.WEBUI_CHECK_INTERVAL_SECONDS * self.WEBUI_WARN_CYCLE_THRESHOLD}s 未增加) !!!"
+                  else:
+                       # 正在计数中，但未达到阈值
+                       webui_status_msg = f"Webui 警报: 文件数 {current_file_count} 未增加! 连续未增加周期: {self.consecutive_webui_no_increase_count}/{self.WEBUI_WARN_CYCLE_THRESHOLD}"
+
+             # 2. 更新上次记录值
+             self.last_webui_file_count = current_file_count
+             self.last_webui_check_time = current_time
+             
+        # 3. 如果在周期内，返回上次的状态
+        elif self.consecutive_webui_no_increase_count > 0:
+             # 如果正在警报计数中，更新当前的状态信息
+             webui_status_msg = f"Webui 警报: 文件数 {self.last_webui_file_count} 未增加! 连续未增加周期: {self.consecutive_webui_no_increase_count}/{self.WEBUI_WARN_CYCLE_THRESHOLD}"
+             if self.consecutive_webui_no_increase_count >= self.WEBUI_WARN_CYCLE_THRESHOLD:
+                 is_webui_alert_active = True
+                 webui_status_msg = f"!!! 警报: Webui 生成任务可能中断 (文件数 {self.last_webui_file_count} 持续 {self.WEBUI_CHECK_INTERVAL_SECONDS * self.WEBUI_WARN_CYCLE_THRESHOLD}s 未增加) !!!"
+
+
+        # 返回当前的警报状态、消息和文件数
+        return is_webui_alert_active, webui_status_msg, current_file_count
+
 
     def _fetch_all_data(self):
         """
@@ -477,6 +600,10 @@ class IntelArcMonitorApp:
         self.last_net_bytes_sent = current_bytes_sent
         self.last_net_bytes_recv = current_bytes_recv
         self.last_update_time = current_time
+        
+        # --- 4. 【新增】检查 Webui 生成状态 ---
+        is_webui_alert_active, webui_status_msg, current_file_count = self._check_webui_generation_status(current_time)
+        # ------------------------------------
 
         # 格式化 GPU 显存数据
         mem_used_gb = mem_used_bytes / 1024**3
@@ -494,6 +621,9 @@ class IntelArcMonitorApp:
             'recv_speed_mbps': recv_speed_mbps, 'sent_speed_mbps': sent_speed_mbps, 
             'recv_percent': recv_percent, 'sent_percent': sent_percent, 'MAX_BANDWIDTH_MBPS': MAX_BANDWIDTH_MBPS,
             'current_time': current_time,
+            'is_webui_alert_active': is_webui_alert_active, # 【新增】Webui 警报状态
+            'webui_status_msg': webui_status_msg, # 【新增】Webui 状态信息
+            'current_file_count': current_file_count, # 【新增】当前文件数量
             'error': None # 默认无错误
         }
 
@@ -546,9 +676,10 @@ class IntelArcMonitorApp:
                 
             error_msg = f"数据获取失败: {error}"
             logger.error(error_msg)
-            # 在错误情况下，两个 Label 都显示错误信息
+            # 在错误情况下，所有 Label 都显示错误信息
             self.status_vram_label.config(text=f"错误: VRAM 数据获取失败", fg="red")
             self.status_vm_label.config(text=f"详细信息: {error}", fg="red")
+            self.status_webui_label.config(text=f"Webui 状态: 数据获取失败", fg="red") # <-- ADDED
             self.name_label.config(text="!!! 致命错误: 数据获取中断 !!!", fg="red")
             self.failure_count += 1
             self.log_count_label.config(text=f"总次数: {self.total_checks} | 正常: {self.success_count} | 警报触发: {self.failure_count}")
@@ -574,6 +705,11 @@ class IntelArcMonitorApp:
         sent_percent = fetched_data['sent_percent']
         MAX_BANDWIDTH_MBPS = fetched_data['MAX_BANDWIDTH_MBPS']
         current_time = fetched_data['current_time']
+
+        # 【新增】Webui 监控数据
+        is_webui_alert_active = fetched_data['is_webui_alert_active']
+        webui_status_msg = fetched_data['webui_status_msg']
+        current_file_count = fetched_data['current_file_count']
 
         # =======================================================
         # 更新数据和数据条
@@ -623,9 +759,9 @@ class IntelArcMonitorApp:
         # 进度条使用 sent_percent，颜色使用 _get_color()
         self._update_progress_bar('net_sent', sent_percent)
         
-        # --- 检查警报条件 (仅 VRAM 触发铃声警报) ---
+        # --- 检查警报条件 (仅 VRAM 和 Webui 触发铃声警报) ---
         
-        # 警报条件触发标志：Webui 中断警报 (仅 VRAM < 8GB)
+        # 警报条件触发标志：VRAM < 8GB OR Webui 持续未增加
         is_interrupt_warn_met = False
         vram_status_msg = ""
         vm_status_msg = ""
@@ -646,38 +782,57 @@ class IntelArcMonitorApp:
         else:
              # VM 正常提示
              vm_status_msg = f"VM 状态: 正常 ({vram_system_used_gb:.1f} GB)"
-            
+             
+        # 3. Webui 文件数量未增加警报
+        if is_webui_alert_active:
+             is_interrupt_warn_met = True
+             
         
-        # --- 根据警报状态更新两个 Label ---
+        # --- 根据警报状态更新所有 Label ---
         if is_interrupt_warn_met:
-            # 触发 VRAM 中断警报时：所有警报相关的 Label 都显示红色
-            self.name_label.config(text="!!! 警报: Webui 可能已中断 !!!", fg="red")
-            self.status_vram_label.config(text=vram_status_msg, fg="red")
-            # VM Label 在 VRAM 警报时也显示红色，强调风险，但警报触发是 VRAM 决定的
-            self.status_vm_label.config(text=vm_status_msg, fg="red") 
+            # 触发 VRAM 或 Webui 中断警报时：所有警报相关的 Label 都显示红色
+            self.name_label.config(text="!!! 警报: 任务可能已中断 !!!", fg="red")
             
-            # 【核心逻辑 1: 延迟触发】如果警报未激活，则累加计数器
+            # 第一行：专有显存状态
+            self.status_vram_label.config(text=vram_status_msg, fg="red")
+            # 第二行：虚拟内存风险提示
+            self.status_vm_label.config(text=vm_status_msg, fg="red") 
+            # 第三行：【新增】Webui 任务状态提示
+            self.status_webui_label.config(text=webui_status_msg, fg="red")
+            
+            # 【核心逻辑 1: 延迟触发】如果警报未激活，则累加计数器 (VRAM/Webui 警报都走这个逻辑)
             if not self.is_alarm_active:
                 self.consecutive_warn_count += 1
                 
-                # 如果连续计数达到阈值，则启动警报
+                # 如果连续计数达到阈值，则启动警报 (VRAM 或 Webui 的警报都走这个逻辑)
                 if self.consecutive_warn_count >= self.WARN_COUNT_THRESHOLD:
                     
                     # 【新增】：记录正式报警开始时间
                     if self.alarm_start_time is None:
                          self.alarm_start_time = time.time()
                          start_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.alarm_start_time))
-                         logger.critical(f"正式警报已启动！报警开始时间: {start_time_str}")
+                         
+                         # 记录详细的警报原因
+                         warn_reasons = []
+                         if mem_used_bytes < self.MEMORY_WARN_THRESHOLD_BYTES:
+                              warn_reasons.append("VRAM 低于 8GB")
+                         if is_webui_alert_active:
+                              warn_reasons.append(f"Webui 文件数 {current_file_count} 持续未增加")
+                              
+                         logger.critical(f"正式警报已启动！报警开始时间: {start_time_str}。原因: {', '.join(warn_reasons)}")
                     
                     self.is_alarm_active = True
                     self.failure_count += 1
                     self.consecutive_warn_count = 0
                     self._play_beep_alarm()
                 else:
-                     # 记录详细的警报信息
+                     # 记录详细的警报信息 (延迟触发中)
                      current_warn_parts = []
                      if mem_used_bytes < self.MEMORY_WARN_THRESHOLD_BYTES:
                           current_warn_parts.append("VRAM 低于 8GB")
+                     if is_webui_alert_active:
+                          current_warn_parts.append("Webui 文件数持续未增加")
+                          
                      logger.warning(f"中断警报条件满足 ({', '.join(current_warn_parts)})，连续计数: {self.consecutive_warn_count}/{self.WARN_COUNT_THRESHOLD}。未达警报阈值。")
                      
             # 【警报循环播放 Bug 逻辑】：如果警报已启动 (is_alarm_active=True)，但音乐已停止 (playback.active=False)，则重新启动音乐。
@@ -685,7 +840,7 @@ class IntelArcMonitorApp:
                  # 播放计数和日志打印已在 _play_beep_alarm 内部处理
                  self._play_beep_alarm()
                      
-        else: # 警报条件不满足 (VRAM >= 8 GB)
+        else: # 警报条件不满足 (VRAM >= 8 GB 且 Webui 状态正常)
             
             # 恢复标题颜色
             self.name_label.config(text="GPU: Intel Arc A770 16GB", fg="black")
@@ -700,6 +855,10 @@ class IntelArcMonitorApp:
             else:
                  # VM 正常，恢复默认颜色或绿色
                  self.status_vm_label.config(text=vm_status_msg, fg="SystemButtonFace") 
+                 
+            # 第三行：【新增】Webui 任务状态提示
+            self.status_webui_label.config(text=webui_status_msg, fg="green") # 正常时显示绿色
+
             
             # 【核心逻辑 2: 立即停止】如果警报状态是 True，强制停止音乐 (解决警报循环 Bug)
             if self.is_alarm_active:
@@ -728,9 +887,9 @@ class IntelArcMonitorApp:
             
             # 记录正常日志
             if cpu_percent is not None:
-                 log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}% | Net Recv: {recv_speed_mbps:.2f} MB/s"
+                 log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}% | Net Recv: {recv_speed_mbps:.2f} MB/s | Webui File Count: {current_file_count}"
             else:
-                 log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败"
+                 log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败 | Webui File Count: {current_file_count}"
             logger.info(log_msg)
             
         # --- 周期性 VM 使用量记录 ---
@@ -747,7 +906,8 @@ if __name__ == '__main__':
     try:
         root = tk.Tk()
         print("=" * 70)
-        print("程序核心功能: 持续监控 VRAM 使用情况，确保 Webui 等任务持续运行 (VRAM >= 8GB)。")
+        print("程序核心功能 1: 持续监控 VRAM 使用情况，确保 Webui 等任务持续运行 (VRAM >= 8GB)。")
+        print("程序核心功能 2: 持续监控 Webui 输出目录文件数量，未增加则警报。")
         print("次要功能: 监控 VM 使用量，超过 80GB 时给出橙色风险提醒，并周期性记录其增长量。")
         print("【新增功能】：实时时钟显示 (1秒刷新) 和多线程数据采集 (避免UI卡顿)。")
         print("=" * 70)
