@@ -4,10 +4,11 @@ import tkinter as tk
 import time
 import sys
 import subprocess
-from just_playback import Playback # <-- 使用 just_playback
+import psutil # <-- 用于获取系统CPU和内存信息
+from just_playback import Playback
 import platform
 from loguru import logger
-import winsound # <-- 用于错误回退，以防 just_playback 播放失败
+import winsound
 
 # --- Loguru 配置 (完美的日志输出) ---
 logger.remove()
@@ -19,22 +20,27 @@ logger.add(sys.stderr, level="INFO", format="<green>{time:YYYY-MM-DD HH:mm:ss.SS
 class IntelArcMonitorApp:
     """
     Intel Arc A770 实时监控应用程序，使用系统命令行工具获取GPU信息，
-    并用tkinter显示和警报（使用 just_playback 确保 WAV 文件完整播放，并在状态正常时强制停止）。
+    并用tkinter显示和警报，现已增强数据条和颜色警报功能。
+    
+    数据顺序：CPU -> 物理内存 -> 虚拟内存 -> GPU 利用率 -> 专有显存
     """
     
     # 显存警告阈值：8GB (转换为Bytes)
     MEMORY_WARN_THRESHOLD_GB = 8
     MEMORY_WARN_THRESHOLD_BYTES = MEMORY_WARN_THRESHOLD_GB * 1024**3
     
+    # 连续警报次数阈值 (用于实现警报延迟触发)
+    WARN_COUNT_THRESHOLD = 7
+
     # 监控更新间隔 (毫秒)
     UPDATE_INTERVAL_MS = 1500  # 1.5秒
     
-    # 蜂鸣声参数 (已不再使用，但保留常量)
-    BEEP_FREQUENCY = 1500  # 频率 1500 Hz
-    BEEP_DURATION = 300    # 持续 300 毫秒
-    
     # 自定义警报声音文件
     ALARM_WAV_FILE = "7 you.wav"
+    
+    # 数据条尺寸常量
+    BAR_WIDTH = 250
+    BAR_HEIGHT = 15
 
     def __init__(self, master):
         """
@@ -44,8 +50,9 @@ class IntelArcMonitorApp:
         self.playback = None 
         
         self.master = master
-        master.title("Intel Arc A770 实时监控 (自定义警报 - just_playback)")
-        master.geometry("400x220")
+        master.title("Intel Arc A770 实时监控 (数据条增强)")
+        # 增大窗口以容纳数据条
+        master.geometry("450x450") 
         
         self.os_type = platform.system()
         if self.os_type != "Windows":
@@ -55,9 +62,10 @@ class IntelArcMonitorApp:
         self.total_checks = 0
         self.success_count = 0
         self.failure_count = 0
-        
-        # 【核心改动】：警报状态标志。True 表示警报条件已触发且音乐已启动。
+        # 警报状态标志。True 表示警报条件已满足阈值且音乐已启动。
         self.is_alarm_active = False 
+        # 连续触发警报条件的次数计数器
+        self.consecutive_warn_count = 0
 
         # 创建并配置tkinter界面
         self._setup_gui()
@@ -76,57 +84,140 @@ class IntelArcMonitorApp:
         
         logger.info("Intel Arc GPU 监控应用启动成功。")
 
+    def _setup_progress_bar(self, name):
+        """
+        为指定的指标设置进度条组件。
+        进度条由一个灰色的背景Label和一个动态宽度的填充Label组成，通过 place() 方法进行控制，
+        以确保像素级的准确对齐。
+        """
+        # 创建一个Frame来容纳背景和填充，以便对齐
+        frame = tk.Frame(self.master, height=self.BAR_HEIGHT, bg='SystemButtonFace')
+        frame.pack(fill='x', padx=10)
+        
+        # 灰色背景 (整体宽度, 使用 place 确保像素定位和宽度)
+        bg_bar = tk.Label(frame, bg='#CCCCCC')
+        bg_bar.place(x=0, y=0, width=self.BAR_WIDTH, height=self.BAR_HEIGHT) 
+        
+        # 颜色填充条 (动态宽度，初始宽度为 0)
+        fill_bar = tk.Label(frame, bg='green', height=1)
+        # 使用 place() 保证它能叠加在 bg_bar 上，并可以独立控制宽度
+        fill_bar.place(x=0, y=0, width=0, height=self.BAR_HEIGHT)
+        
+        # 将组件存入实例变量，以便在 update_gpu_info 中访问和更新
+        setattr(self, f'{name}_fill_bar', fill_bar)
+        setattr(self, f'{name}_bg_bar', bg_bar)
+
+    def _get_color(self, percentage):
+        """
+        根据百分比返回颜色代码（绿、橙、红）实现视觉警报。
+        < 50%: 绿色 | 50% - 75%: 橙色 | > 75%: 红色
+        """
+        if percentage >= 75:
+            return 'red'
+        elif percentage >= 50:
+            return 'orange'
+        else:
+            return 'green'
+
+
     def _setup_gui(self):
         """
-        配置GUI界面元素。
+        配置GUI界面元素，并按照指定顺序设置标签和数据条。
         """
-        # GPU 名称标签
+        # GPU 名称标签 (保持不变，作为标题)
         self.name_label = tk.Label(self.master, text="GPU: Intel Arc A770 16GB", font=('Arial', 12, 'bold'))
         self.name_label.pack(pady=5)
         
-        # 算力利用率标签
-        self.utilization_label = tk.Label(self.master, text="GPU 综合利用率: N/A", font=('Arial', 14))
-        self.utilization_label.pack(pady=5)
+        # 1. CPU 利用率 (字体统一为 14)
+        self.cpu_label = tk.Label(self.master, text="CPU 利用率: N/A", font=('Arial', 14), anchor='w')
+        self.cpu_label.pack(fill='x', padx=10, pady=(10, 0))
+        self._setup_progress_bar('cpu')
 
-        # 显存占用标签
-        self.memory_label = tk.Label(self.master, text="显存占用: N/A", font=('Arial', 14))
-        self.memory_label.pack(pady=5)
+        # 2. 物理内存占用
+        self.ram_label = tk.Label(self.master, text="物理内存占用: N/A", font=('Arial', 14), anchor='w')
+        self.ram_label.pack(fill='x', padx=10, pady=(10, 0))
+        self._setup_progress_bar('ram')
 
-        # 警告标签
+        # 3. 虚拟内存占用
+        self.shared_memory_label = tk.Label(self.master, text="虚拟内存占用: N/A", font=('Arial', 14), anchor='w')
+        self.shared_memory_label.pack(fill='x', padx=10, pady=(10, 0))
+        self._setup_progress_bar('vram_system')
+        
+        # 4. GPU 综合利用率
+        self.utilization_label = tk.Label(self.master, text="GPU 综合利用率: N/A", font=('Arial', 14), anchor='w')
+        self.utilization_label.pack(fill='x', padx=10, pady=(10, 0))
+        self._setup_progress_bar('gpu_util')
+
+        # 5. 专有显存占用
+        self.memory_label = tk.Label(self.master, text="专有显存占用: N/A", font=('Arial', 14), anchor='w')
+        self.memory_label.pack(fill='x', padx=10, pady=(10, 0))
+        self._setup_progress_bar('vram_local')
+
+        # 警告标签 (独立于数据条的文字警报)
         self.warning_label = tk.Label(self.master, text="监控正常", font=('Arial', 12), fg="green")
         self.warning_label.pack(pady=5)
 
         # 日志计数标签
-        self.log_count_label = tk.Label(self.master, text="总次数: 0 | 正常: 0 | 警报: 0", font=('Arial', 10), anchor='w')
+        self.log_count_label = tk.Label(self.master, text="总次数: 0 | 正常: 0 | 警报触发: 0", font=('Arial', 10), anchor='w')
         self.log_count_label.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+
+
+    def _get_system_stats_psutil(self):
+        """
+        使用 psutil 库获取系统 CPU、物理内存和虚拟内存数据及其占用百分比。
+        """
+        try:
+            # 获取 CPU 利用率 (非阻塞)
+            cpu_percent = psutil.cpu_percent(interval=None) 
+            
+            # 获取 物理内存 (RAM)
+            ram_stats = psutil.virtual_memory()
+            ram_used_gb = ram_stats.used / 1024**3
+            ram_total_gb = ram_stats.total / 1024**3
+            ram_percent = ram_stats.percent # 获取物理内存占用百分比
+            
+            # 获取 虚拟内存 (Swap)
+            swap_stats = psutil.swap_memory()
+            swap_used_gb = swap_stats.used / 1024**3
+            swap_total_gb = swap_stats.total / 1024**3
+            swap_percent = swap_stats.percent # 获取虚拟内存占用百分比
+            
+            return cpu_percent, ram_used_gb, ram_total_gb, ram_percent, swap_used_gb, swap_total_gb, swap_percent
+        
+        except Exception as e:
+            logger.error(f"通过 psutil 获取系统数据失败: {e}")
+            # 失败时返回 None 确保程序不中断
+            return None, None, None, None, None, None, None
 
 
     def _get_gpu_stats_windows(self):
         """
         [Windows 平台专用]
-        通过 PowerShell 性能计数器获取 GPU 综合利用率和显存占用。
+        通过 PowerShell 性能计数器获取 GPU 综合利用率和专有显存占用。
         """
         if self.os_type != "Windows":
-            # 如果不是 Windows，则不执行 PowerShell 命令，避免报错
             raise NotImplementedError("非 Windows 操作系统，无法执行 PowerShell 命令。")
             
         try:
             # --- 1. 获取 GPU 综合利用率 ---
-            # 使用 "\GPU Engine(*)\Utilization Percentage" 获取所有引擎的利用率，并计算平均值，
-            # 以最大程度地接近任务管理器显示的“总利用率”。
+            # 使用 (*) 通配符获取所有 GPU 引擎的平均利用率
             util_cmd = r'powershell -ExecutionPolicy Bypass -Command "((Get-Counter \"\GPU Engine(*)\Utilization Percentage\").CounterSamples | Select-Object -ExpandProperty CookedValue | Measure-Object -Average).Average"'
             result = subprocess.run(util_cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            gpu_util = float(result.stdout.strip())
+            # 使用 or 0.0 处理 PowerShell 偶尔返回空值的情况
+            gpu_util = float(result.stdout.strip() or 0.0) 
             
-            # --- 2. 获取 显存占用 (Local Usage) ---
+            # --- 2. 获取 专有显存占用 (Local Usage) ---
             mem_cmd = r'powershell -ExecutionPolicy Bypass -Command "((Get-Counter \"\GPU Process Memory(*)\Local Usage\").CounterSamples | Select-Object -ExpandProperty CookedValue | Measure-Object -Sum).Sum"'
             result = subprocess.run(mem_cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
             mem_used_bytes = float(result.stdout.strip() or 0)
             
-            # 硬编码总显存
+            # 硬编码总显存 (Intel Arc A770 16GB)
             mem_total_bytes = 16 * 1024**3
             
-            return gpu_util, mem_used_bytes, mem_total_bytes
+            # 计算专有显存占用百分比
+            vram_local_percent = (mem_used_bytes / mem_total_bytes) * 100 if mem_total_bytes > 0 else 0
+            
+            return gpu_util, mem_used_bytes, mem_total_bytes, vram_local_percent
 
         except subprocess.CalledProcessError as e:
             logger.error(f"PowerShell 命令执行失败，错误代码: {e.returncode}，输出: {e.stderr.strip()}")
@@ -138,8 +229,7 @@ class IntelArcMonitorApp:
 
     def _play_beep_alarm(self):
         """
-        【核心警报功能】播放自定义 WAV 文件（使用 just_playback）。
-        此函数只负责启动播放，不负责停止或状态管理。
+        播放自定义 WAV 文件（使用 just_playback）作为警报。
         """
         logger.info("尝试播放声音警报...")
         if self.os_type == "Windows":
@@ -149,70 +239,135 @@ class IntelArcMonitorApp:
                     if self.playback.active:
                         self.playback.stop() 
                     
-                    # 关键步骤：重置播放位置到文件开头，确保每次都完整播放
+                    # 重置播放位置到文件开头，确保每次都完整播放
                     self.playback.seek(0) 
-                    
-                    # 播放预加载的文件 (非阻塞)
-                    self.playback.play() 
+                    self.playback.play() # 播放预加载的文件 (非阻塞)
                 except Exception as e:
                     logger.error(f"播放自定义声音文件 '{self.ALARM_WAV_FILE}' 失败（just_playback）：{e}。")
-                    # 播放失败时，回退到播放系统警报音
+                    # 播放失败时，回退到系统警报音
                     winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
             else:
                 # 如果播放器初始化失败，回退到系统警报音
                 winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
         else:
-             # 针对非 Windows 系统 (如 Linux/macOS) 的备用方案：
-             # 打印 ASCII 铃声字符 '\a' (BEL)，尝试在终端发出声响。
+             # 非 Windows 系统备用方案
              print('\a', end='', flush=True) 
              logger.warning("非 Windows 系统，使用终端铃声作为替代。")
+
+    def _update_progress_bar(self, name, percentage):
+        """
+        根据百分比更新指定指标的数据条 Label 的宽度和颜色。
+        """
+        # 获取动态填充条的引用
+        fill_bar = getattr(self, f'{name}_fill_bar')
+        
+        # 确保百分比在 0 到 100 之间，防止计算错误
+        percentage = max(0, min(100, percentage))
+        
+        # 计算新的宽度：总宽度 * 百分比。由于 bg_bar 宽度是 BAR_WIDTH 像素，此处计算结果也是像素。
+        new_width = int(self.BAR_WIDTH * (percentage / 100))
+        # 获取颜色（基于 50%/75% 阈值）
+        color = self._get_color(percentage)
+        
+        # 更新填充条的宽度和背景色
+        fill_bar.place(width=new_width)
+        fill_bar.config(bg=color)
 
 
     def update_gpu_info(self):
         """
-        获取GPU信息并更新界面，同时检查警报条件和控制音乐播放状态。
+        获取GPU和系统信息，更新界面数据和进度条，并检查警报条件。
         """
         
         self.total_checks += 1
         
         try:
-            gpu_util, mem_used_bytes, mem_total_bytes = self._get_gpu_stats_windows()
+            # --- 1. 获取 GPU 专有数据 ---
+            gpu_util, mem_used_bytes, mem_total_bytes, vram_local_percent = self._get_gpu_stats_windows()
+
+            # --- 2. 获取 系统数据 ---
+            cpu_percent, ram_used_gb, ram_total_gb, ram_percent, swap_used_gb, swap_total_gb, swap_percent = self._get_system_stats_psutil()
             
+            # 格式化 GPU 显存数据
             mem_used_gb = mem_used_bytes / 1024**3
             mem_total_gb = mem_total_bytes / 1024**3
             
-            # 更新界面标签
-            self.utilization_label.config(text=f"GPU 综合利用率: {gpu_util:.2f}%")
-            self.memory_label.config(text=f"显存占用: {mem_used_gb:.2f} GB / {mem_total_gb:.2f} GB")
+            # =======================================================
+            # 更新数据和数据条 (按指定顺序：CPU, RAM, VRAM_SYS, GPU_UTIL, VRAM_LOCAL)
+            # =======================================================
+            if cpu_percent is not None:
+                 # 1. CPU 利用率
+                 self.cpu_label.config(text=f"CPU 利用率: {cpu_percent:.1f}%")
+                 self._update_progress_bar('cpu', cpu_percent)
+                 
+                 # 2. 物理内存占用
+                 self.ram_label.config(text=f"物理内存占用: {ram_used_gb:.1f} GB / {ram_total_gb:.1f} GB ({ram_percent:.1f}%)")
+                 self._update_progress_bar('ram', ram_percent)
+                 
+                 # 3. 虚拟内存占用 (Swap)
+                 self.shared_memory_label.config(text=f"虚拟内存占用: {swap_used_gb:.1f} GB / {swap_total_gb:.1f} GB ({swap_percent:.1f}%)")
+                 self._update_progress_bar('vram_system', swap_percent)
+            else:
+                 # 系统数据获取失败时，显示错误信息并清空进度条
+                 self.cpu_label.config(text="CPU 利用率: N/A (PSUTIL ERROR)")
+                 self.ram_label.config(text="物理内存占用: N/A (PSUTIL ERROR)")
+                 self.shared_memory_label.config(text="虚拟内存占用: N/A (PSUTIL ERROR)")
+                 self._update_progress_bar('cpu', 0)
+                 self._update_progress_bar('ram', 0)
+                 self._update_progress_bar('vram_system', 0)
             
-            # --- 检查警报条件 ---
-            if mem_used_bytes < self.MEMORY_WARN_THRESHOLD_BYTES: # 警报条件满足
-                # 显存占用低于8GB阈值，触发警报
-                self.failure_count += 1
-                alarm_msg = f"!!! 警报: Webui 可能已中断 !!! 显存占用: {mem_used_gb:.2f} GB (低于 {self.MEMORY_WARN_THRESHOLD_GB} GB)"
+            # 4. GPU 综合利用率
+            self.utilization_label.config(text=f"GPU 综合利用率: {gpu_util:.2f}%")
+            self._update_progress_bar('gpu_util', gpu_util)
+            
+            # 5. 专有显存占用
+            self.memory_label.config(text=f"专有显存占用: {mem_used_gb:.2f} GB / {mem_total_gb:.2f} GB ({vram_local_percent:.1f}%)")
+            self._update_progress_bar('vram_local', vram_local_percent)
+            
+            # --- 检查警报条件 (基于专有显存低于 8 GB) ---
+            if mem_used_bytes < self.MEMORY_WARN_THRESHOLD_BYTES:
+                alarm_msg = f"!!! 警报: Webui 可能已中断 !!! 专有显存: {mem_used_gb:.2f} GB (低于 {self.MEMORY_WARN_THRESHOLD_GB} GB)"
                 self.warning_label.config(text=alarm_msg, fg="red")
-                logger.warning(alarm_msg)
                 
-                # 只有当警报状态首次激活时才播放音乐，防止反复中断
+                # 【核心逻辑 1: 延迟触发】如果警报未激活，则累加计数器
                 if not self.is_alarm_active:
-                    self.is_alarm_active = True
-                    # --- 触发声音警告 (开始循环播放) ---
-                    self._play_beep_alarm() 
+                    self.consecutive_warn_count += 1
+                    
+                    # 如果连续计数达到阈值，则启动警报
+                    if self.consecutive_warn_count >= self.WARN_COUNT_THRESHOLD:
+                        self.is_alarm_active = True
+                        self.failure_count += 1
+                        self.consecutive_warn_count = 0
+                        self._play_beep_alarm()
+                        logger.critical(f"连续 {self.WARN_COUNT_THRESHOLD} 次检测到低专有显存，警报音乐启动！")
+                    else:
+                         logger.warning(f"低专有显存，连续计数: {self.consecutive_warn_count}/{self.WARN_COUNT_THRESHOLD}。未达警报阈值。")
+                         
+            else: # 警报条件不满足 (专有显存高于 8 GB)
+                normal_msg = "监控正常 (专有显存高于 8 GB)"
                 
-            else: # 警报条件不满足 (显存高于 8 GB)
-                # 显存占用正常
-                self.success_count += 1
-                normal_msg = "监控正常 (显存高于 8 GB)"
-                
-                # 如果警报状态是 True，表示警报刚刚解除，需要强制停止音乐
+                # 【核心逻辑 2: 立即停止】如果警报状态是 True，强制停止音乐
                 if self.is_alarm_active:
                     self.is_alarm_active = False
                     if self.playback and self.playback.active:
                         self.playback.stop()
                         logger.info("警报条件解除，已强制停止警报音乐。")
-
+                
+                # 【核心逻辑 3: 状态重置】只要不满足警报条件，就重置连续计数器
+                if self.consecutive_warn_count > 0:
+                    logger.info(f"专有显存恢复正常 (> 8 GB)，连续低显存计数器重置 (原值: {self.consecutive_warn_count})。")
+                    self.consecutive_warn_count = 0
+                
                 self.warning_label.config(text=normal_msg, fg="green")
-                logger.info(f"状态正常 | 综合利用率: {gpu_util:.2f}% | 显存: {mem_used_gb:.2f} GB")
+                self.success_count += 1
+                
+                # 记录正常日志
+                if cpu_percent is not None:
+                     log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | CPU Util: {cpu_percent:.1f}%"
+                else:
+                     log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败"
+                logger.info(log_msg)
+
 
         except Exception as e:
             error_msg = f"数据获取失败: {e}"
@@ -221,7 +376,7 @@ class IntelArcMonitorApp:
             self.failure_count += 1
         
         # 更新日志计数器
-        self.log_count_label.config(text=f"总次数: {self.total_checks} | 正常: {self.success_count} | 警报: {self.failure_count}")
+        self.log_count_label.config(text=f"总次数: {self.total_checks} | 正常: {self.success_count} | 警报触发: {self.failure_count}")
 
         # 设置定时器，再次调用自身，实现实时更新
         self.master.after(self.UPDATE_INTERVAL_MS, self.update_gpu_info)
