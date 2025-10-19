@@ -22,7 +22,7 @@ class IntelArcMonitorApp:
     Intel Arc A770 实时监控应用程序，使用系统命令行工具获取GPU信息，
     并用tkinter显示和警报，现已增强数据条和颜色警报功能。
     
-    数据顺序：CPU -> 物理内存 -> 虚拟内存 -> GPU 利用率 -> 专有显存
+    数据顺序：CPU -> 物理内存 -> 虚拟内存 -> GPU 利用率 -> 专有显存 -> 下载速度 -> 上传速度
     """
     
     # 显存警告阈值：8GB (转换为Bytes)
@@ -70,6 +70,11 @@ class IntelArcMonitorApp:
         self.is_alarm_active = False 
         # 连续触发警报条件的次数计数器
         self.consecutive_warn_count = 0
+        
+        # --- 新增网络状态追踪变量 ---
+        self.last_net_bytes_sent = 0
+        self.last_net_bytes_recv = 0
+        self.last_update_time = time.time() # 记录上次更新的时间戳，用于计算速度
 
         # 创建并配置tkinter界面
         self._setup_gui()
@@ -126,9 +131,11 @@ class IntelArcMonitorApp:
 
     def _setup_gui(self):
         """
-@@    110,111,-1,114,115,-1,118,119,-1,122,123,-1,126,127,-1,130,130,-1,132,133,-1,136,136,-1   @@
         配置GUI界面元素，并按照指定顺序设置标签和数据条。
         """
+        # 调整窗口大小以容纳新增的两个网络指标
+        self.master.geometry("450x550")
+        
         # GPU 名称标签 (保持不变，作为标题)
         self.name_label = tk.Label(self.master, text="GPU: Intel Arc A770 16GB", font=('Arial', 12, 'bold'))
         self.name_label.pack(pady=5)
@@ -148,8 +155,8 @@ class IntelArcMonitorApp:
         self.shared_memory_label.pack(fill='x', padx=10, pady=(10, 0))
         self._setup_progress_bar('vram_system')
         
-        # 4. GPU 综合利用率
-        self.utilization_label = tk.Label(self.master, text="GPU 综合利用率: N/A", font=('Arial', 14), anchor='w')
+        # 4. GPU Copy 性能占用
+        self.utilization_label = tk.Label(self.master, text="GPU Copy 性能占用: N/A", font=('Arial', 14), anchor='w')
         self.utilization_label.pack(fill='x', padx=10, pady=(10, 0))
         self._setup_progress_bar('gpu_util')
 
@@ -158,7 +165,19 @@ class IntelArcMonitorApp:
         self.memory_label.pack(fill='x', padx=10, pady=(10, 0))
         self._setup_progress_bar('vram_local')
 
-        # --- 新增：VRAM/VM 状态独立显示 (两行，不同颜色) ---
+        # --- 新增：网络传输速度 ---
+        # 6. 下载速度
+        self.net_recv_label = tk.Label(self.master, text="下载速度: N/A", font=('Arial', 14), anchor='w')
+        self.net_recv_label.pack(fill='x', padx=10, pady=(10, 0))
+        self._setup_progress_bar('net_recv')
+        
+        # 7. 上传速度
+        self.net_sent_label = tk.Label(self.master, text="上传速度: N/A", font=('Arial', 14), anchor='w')
+        self.net_sent_label.pack(fill='x', padx=10, pady=(10, 0))
+        self._setup_progress_bar('net_sent')
+        # ---------------------------
+
+        # --- VRAM/VM 状态独立显示 (两行，不同颜色) ---
         # 第一行：专有显存状态（用于确认程序运行）
         self.status_vram_label = tk.Label(self.master, text="状态: 监控正常", font=('Arial', 12, 'bold'), fg="green")
         self.status_vram_label.pack(pady=(5, 0)) # 上方留白
@@ -232,15 +251,18 @@ class IntelArcMonitorApp:
     def _get_gpu_stats_windows(self):
         """
         [Windows 平台专用]
-        通过 PowerShell 性能计数器获取 GPU 综合利用率和专有显存占用。
+        通过 PowerShell 性能计数器获取 GPU **复制(Copy)性能占用**和专有显存占用。
+        
+        *重构优化点 (难度系数: 1/10):* 将 GPU 综合利用率替换为 GPU Copy 性能占用。
         """
         if self.os_type != "Windows":
             raise NotImplementedError("非 Windows 操作系统，无法执行 PowerShell 命令。")
             
         try:
-            # --- 1. 获取 GPU 综合利用率 ---
-            # 使用 (*) 通配符获取所有 GPU 引擎的平均利用率
-            util_cmd = r'powershell -ExecutionPolicy Bypass -Command "((Get-Counter \"\GPU Engine(*)\Utilization Percentage\").CounterSamples | Select-Object -ExpandProperty CookedValue | Measure-Object -Average).Average"'
+            # --- 1. 获取 GPU 复制(Copy)性能占用 ---
+            # 获取 GPU 复制(Copy)引擎的平均利用率 (替换为Copy性能)
+            # 注意：如果路径不匹配，请根据 PowerShell 'Get-Counter "\GPU Engine(*)\Utilization Percentage"' 的输出手动调整 engtype_copy_* 部分
+            util_cmd = r'powershell -ExecutionPolicy Bypass -Command "((Get-Counter \"\GPU Engine(engtype_copy_*)\Utilization Percentage\").CounterSamples | Select-Object -ExpandProperty CookedValue | Measure-Object -Average).Average"'
             result = subprocess.run(util_cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
             # 使用 or 0.0 处理 PowerShell 偶尔返回空值的情况
             gpu_util = float(result.stdout.strip() or 0.0) 
@@ -315,25 +337,63 @@ class IntelArcMonitorApp:
 
     def update_gpu_info(self):
         """
-        @@    378,394,-17,415,418,-4,423,424,-2,432,432,0,439,439,+18   @@
         获取GPU和系统信息，更新界面数据和进度条，并检查警报条件。
+        
+        *重构优化点 (难度系数: 3/10):* 新增网络传输速度监控。
         """
         
         self.total_checks += 1
+        # 记录本次更新的时间
+        current_time = time.time()
         
         try:
-            # --- 1. 获取 GPU 专有数据 ---
+            # --- 1. 获取 GPU 专有数据 (现为 Copy Engine 性能) ---
             gpu_util, mem_used_bytes, mem_total_bytes, vram_local_percent = self._get_gpu_stats_windows()
 
             # --- 2. 获取 系统数据 ---
             cpu_percent, ram_used_gb, ram_total_gb, ram_percent, vram_system_used_bytes, vram_system_total_bytes = self._get_system_stats_psutil()
             
+            # --- 3. 获取网络 I/O 统计并计算速度 ---
+            net_io = psutil.net_io_counters()
+            current_bytes_sent = net_io.bytes_sent
+            current_bytes_recv = net_io.bytes_recv
+            
+            time_diff = current_time - self.last_update_time
+            
+            # 首次运行时 time_diff 可能为 0 或接近 0，或者 last_bytes 为 0，不进行计算或避免除以零
+            if time_diff > 0 and self.last_net_bytes_sent != 0:
+                 # 计算下载和上传速度 (Bytes/秒)
+                 recv_speed_bps = (current_bytes_recv - self.last_net_bytes_recv) / time_diff
+                 sent_speed_bps = (current_bytes_sent - self.last_net_bytes_sent) / time_diff
+                 
+                 # 转换为 MB/秒
+                 recv_speed_mbps = recv_speed_bps / 1024**2
+                 sent_speed_mbps = sent_speed_bps / 1024**2
+                 
+                 # 最大的预期带宽（例如 1Gbps / 8 = 125 MB/s），用于进度条的百分比计算
+                 # 这里假设一个合理的上限 100 MB/s (800 Mbps)，以便在普通网络下进度条有变化
+                 MAX_BANDWIDTH_MBPS = 100 
+                 recv_percent = (recv_speed_mbps / MAX_BANDWIDTH_MBPS) * 100
+                 sent_percent = (sent_speed_mbps / MAX_BANDWIDTH_MBPS) * 100
+            else:
+                 # 初始或计算失败时设置为 0
+                 recv_speed_mbps = 0.0
+                 sent_speed_mbps = 0.0
+                 recv_percent = 0.0
+                 sent_percent = 0.0
+                 
+            # 更新上次的计数器和时间戳
+            self.last_net_bytes_sent = current_bytes_sent
+            self.last_net_bytes_recv = current_bytes_recv
+            self.last_update_time = current_time
+
+
             # 格式化 GPU 显存数据
             mem_used_gb = mem_used_bytes / 1024**3
             mem_total_gb = mem_total_bytes / 1024**3
             
             # =======================================================
-            # 更新数据和数据条 (按指定顺序：CPU, RAM, VRAM_SYS, GPU_UTIL, VRAM_LOCAL)
+            # 更新数据和数据条 (按指定顺序：CPU, RAM, VRAM_SYS, GPU_UTIL, VRAM_LOCAL, NET_RECV, NET_SENT)
             # =======================================================
             if cpu_percent is not None:
                  # 1. CPU 利用率
@@ -365,13 +425,23 @@ class IntelArcMonitorApp:
                  vram_system_used_bytes = 0
                  vram_system_used_gb = 0
             
-            # 4. GPU 综合利用率
-            self.utilization_label.config(text=f"GPU 综合利用率: {gpu_util:.2f}%")
+            # 4. GPU 复制(Copy)性能占用
+            self.utilization_label.config(text=f"GPU Copy 性能占用: {gpu_util:.2f}%")
             self._update_progress_bar('gpu_util', gpu_util)
             
             # 5. 专有显存占用
             self.memory_label.config(text=f"专有显存占用: {mem_used_gb:.2f} GB / {mem_total_gb:.2f} GB ({vram_local_percent:.1f}%)")
             self._update_progress_bar('vram_local', vram_local_percent)
+            
+            # 6. 下载速度
+            self.net_recv_label.config(text=f"下载速度: {recv_speed_mbps:.2f} MB/s (上限 {MAX_BANDWIDTH_MBPS} MB/s)")
+            # 进度条使用 recv_percent，颜色使用 _get_color()
+            self._update_progress_bar('net_recv', recv_percent)
+            
+            # 7. 上传速度
+            self.net_sent_label.config(text=f"上传速度: {sent_speed_mbps:.2f} MB/s (上限 {MAX_BANDWIDTH_MBPS} MB/s)")
+            # 进度条使用 sent_percent，颜色使用 _get_color()
+            self._update_progress_bar('net_sent', sent_percent)
             
             # --- 检查警报条件 (逻辑组合) ---
             
@@ -453,9 +523,9 @@ class IntelArcMonitorApp:
                 
                 # 记录正常日志
                 if cpu_percent is not None:
-                     log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}%"
+                     log_msg = f"状态正常 | GPU Copy Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}% | Net Recv: {recv_speed_mbps:.2f} MB/s"
                 else:
-                     log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败"
+                     log_msg = f"状态正常 | GPU Copy Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败"
                 logger.info(log_msg)
 
 
