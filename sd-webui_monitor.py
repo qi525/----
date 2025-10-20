@@ -15,6 +15,15 @@ import concurrent.futures
 # 【新增】引入 os 模块，用于文件系统操作和计数
 import os # <-- ADDED
 
+# 【新增】引入 win32pdh 模块用于 GPU 引擎性能计数器
+try:
+    import win32pdh
+except ImportError:
+    logger.error("未安装 'pywin32' 模块，无法使用 PDH 性能计数器。GPU 引擎细分功能将不可用。请运行 'pip install pywin32'。")
+    # 为了防止全局变量未定义，设定一个默认值
+    win32pdh = None
+
+
 # --- Loguru 配置 (完美的日志输出) ---
 logger.remove()
 # 完美的日志输出格式
@@ -22,17 +31,133 @@ logger.add(sys.stderr, level="INFO", format="<green>{time:YYYY-MM-DD HH:mm:ss.SS
 
 # --------------------------------------------------------------------------
 
+# ----------------------------------------------------
+# 【新增】PDH (Performance Data Helper) 初始化和全局变量
+# ----------------------------------------------------
+PDH_AVAILABLE = False
+QUERY_HANDLE = None
+ENGINE_COUNTERS = {} 
+CORE_ENGINES_TO_MONITOR = ["Compute", "Copy", "3D"] 
+ENGINE_TRANSLATIONS = {
+    "Compute": "计算着色器 (AI/挖矿/并行)",
+    "Copy": "数据复制 (显存/内存传输)",
+    "3D": "3D 渲染 (游戏/图形加速)",
+}
+# 硬编码总显存 (Intel Arc A770 16GB)
+INTEL_ARC_A770_TOTAL_BYTES = 16 * 1024**3 
+
+def init_pdh_resources():
+    """
+    初始化 PDH 查询句柄和 GPU 引擎计数器。
+    【改动点 1/5】: 整合 PDH 初始化逻辑。
+    """
+    global PDH_AVAILABLE, QUERY_HANDLE, ENGINE_COUNTERS
+    
+    if platform.system() != "Windows" or win32pdh is None:
+        logger.warning("非 Windows 系统或缺少 pywin32 模块，PDH 监控不可用。")
+        PDH_AVAILABLE = False
+        return
+
+    try:
+        QUERY_HANDLE = win32pdh.OpenQuery()
+        # 通用 GPU 引擎利用率路径
+        COUNTER_PATH = r"\GPU Engine(*)\Utilization Percentage" 
+        counter_paths = win32pdh.ExpandCounterPath(COUNTER_PATH)
+        
+        for path in counter_paths:
+            try:
+                # 提取引擎类型，例如：luid_00000000_00000000_copy_3d
+                full_engine_key = path.split('(')[1].split(')')[0]
+                counter_handle = win32pdh.AddCounter(QUERY_HANDLE, path)
+                ENGINE_COUNTERS[full_engine_key] = counter_handle
+            except Exception as e:
+                logger.warning(f"添加计数器失败: {path}。错误: {e}")
+                
+        if not ENGINE_COUNTERS:
+            logger.error("未找到任何 GPU 引擎性能计数器实例，PDH 初始化失败。")
+            PDH_AVAILABLE = False
+        else:
+            # 第一次采集数据，防止 PDH_CALC_COUNTER_VALUE_FIRST 错误
+            win32pdh.CollectQueryData(QUERY_HANDLE)
+            PDH_AVAILABLE = True
+            logger.info(f"PDH 成功初始化，找到 {len(ENGINE_COUNTERS)} 个 GPU 引擎计数器。")
+            
+    except Exception as e:
+        PDH_AVAILABLE = False
+        logger.error(f"PDH 初始化失败。错误: {e}")
+
+def get_core_gpu_utilization():
+    """
+    获取 GPU 核心引擎 (Compute, Copy, 3D) 的聚合利用率。
+    此函数在后台线程中被调用。
+    """
+    if not PDH_AVAILABLE:
+        # PDH 不可用时返回默认 0 值
+        return {engine: 0 for engine in CORE_ENGINES_TO_MONITOR}
+        
+    core_engine_utilization = {engine: 0.0 for engine in CORE_ENGINES_TO_MONITOR}
+    
+    try:
+        # 采集 PDH 数据，这是 PDH 监控的关键一步
+        win32pdh.CollectQueryData(QUERY_HANDLE)
+        
+        for full_engine_key, counter_handle in ENGINE_COUNTERS.items():
+            try:
+                type_val, value = win32pdh.GetFormattedCounterValue(counter_handle, win32pdh.PDH_FMT_DOUBLE)
+                util_percent = value
+                
+                if util_percent > 0:
+                    # 提取引擎类型 (例如：luid_..._3d 提取 3D)
+                    parts = full_engine_key.split('_')
+                    engine_type = parts[-1] 
+                    
+                    # 仅关注核心引擎
+                    if engine_type in CORE_ENGINES_TO_MONITOR:
+                        # 核心利用率是所有进程中该引擎的利用率之和（PDH 自动聚合）
+                        core_engine_utilization[engine_type] += util_percent
+                        
+            except Exception as e:
+                # 忽略第一次采集数据时可能出现的 PDH_CALC_COUNTER_VALUE_FIRST
+                if hasattr(e, 'winerror') and e.winerror in [win32pdh.PDH_NO_DATA, win32pdh.PDH_CALC_COUNTER_VALUE_FIRST]:
+                     continue
+                logger.warning(f"获取 {full_engine_key} 计数器值失败: {e}")
+                
+        return core_engine_utilization
+        
+    except Exception as e:
+        logger.error(f"PDH 数据收集失败: {e}")
+        # 失败时返回 0，确保程序不中断
+        return {engine: 0.0 for engine in CORE_ENGINES_TO_MONITOR}
+
+def cleanup_pdh_resources():
+    """
+    关闭全局 PDH 查询句柄，释放资源。
+    【改动点 2/5】: 整合 PDH 清理逻辑。
+    """
+    global QUERY_HANDLE, PDH_AVAILABLE
+    
+    if PDH_AVAILABLE and QUERY_HANDLE:
+         try:
+             win32pdh.CloseQuery(QUERY_HANDLE)
+             QUERY_HANDLE = None
+             PDH_AVAILABLE = False
+             logger.info("PDH 查询资源已关闭。")
+         except Exception as e:
+             logger.error(f"关闭 PDH 查询失败: {e}")
+             
+# ----------------------------------------------------
+
 class IntelArcMonitorApp:
     """
-    Intel Arc A770 实时监控应用程序，使用系统命令行工具获取GPU信息，
-    并用tkinter显示和警报，现已增强数据条和颜色警报功能。
+    Intel Arc A770 实时监控应用程序，使用系统命令行工具获取 GPU VRAM 和
+    PDH 获取 GPU 核心引擎细分信息，并用 tkinter 显示和警报。
     
-    数据顺序：CPU -> 物理内存 -> 虚拟内存 -> GPU 性能占用 -> 专有显存 -> 下载速度 -> 上传速度
+    数据顺序：CPU -> 物理内存 -> 虚拟内存 -> GPU 核心引擎 (Compute/Copy/3D) -> 专有显存 -> 下载速度 -> 上传速度
     
     【程序核心功能】
     ------------------------------------------------------------------------------------
     核心目标 1: 持续监控专有显存（VRAM）使用情况，当其低于设定阈值（VRAM < 8GB）时，
-    通过声音和UI进行警报，以确认Webui等任务是否意外中断。
+    通过声音和UI进行警报，以确认 Webui 等任务是否意外中断。
     
     核心目标 2: 持续监控 Webui 输出目录文件数量，当其在设定周期内（默认 30 秒）
     没有增加时，触发警报，以确认 Webui 生成任务是否中断。
@@ -73,13 +198,16 @@ class IntelArcMonitorApp:
         self.playback = None 
         
         self.master = master
-        master.title("Intel Arc A770 实时监控 (数据条增强)")
+        master.title("Intel Arc A770 实时监控 (GPU 核心引擎细分增强)")
         # 增大窗口以容纳数据条、时钟和 Webui 状态
-        master.geometry("450x610") # <-- UPDATED SIZE
+        master.geometry("450x710") # <-- UPDATED SIZE to fit 3 GPU engine bars
         
         self.os_type = platform.system()
         if self.os_type != "Windows":
              logger.warning(f"当前操作系统为 {self.os_type}。注意：本应用的核心功能和声音警报主要在 Windows 上有效。")
+        
+        # 【新增】: 初始化 PDH 资源
+        init_pdh_resources()
 
         # 初始化计数器
         self.total_checks = 0
@@ -108,7 +236,7 @@ class IntelArcMonitorApp:
         self.last_net_bytes_recv = 0
         self.last_update_time = time.time() # 记录上次更新的时间戳，用于计算速度
 
-        # --- 【新增】Webui 文件监控追踪变量 (难度系数: 2) ---
+        # --- Webui 文件监控追踪变量 ---
         # Webui 输出目录的基路径 (用户自定义路径)
         self.WEBUI_OUTPUT_BASE_DIR = r'C:\stable-diffusion-webui\outputs\txt2img-images'
         # 监测 Webui 文件数量的周期 (秒，用户要求 30 秒)
@@ -146,34 +274,36 @@ class IntelArcMonitorApp:
 
     def on_closing(self):
         """
-        处理窗口关闭事件，优雅地关闭线程池。
+        处理窗口关闭事件，优雅地关闭线程池和 PDH 资源。
+        【改动点 3/5】: 在关闭时清理 PDH 资源。
         """
         logger.info("应用接收到关闭信号，正在关闭线程池...")
-        # 立即关闭线程池，不等待正在运行的任务
+        # 1. 立即关闭线程池，不等待正在运行的任务
         self.executor.shutdown(wait=False, cancel_futures=True) 
-        self.master.destroy() # 关闭主窗口
+        # 2. 清理 PDH 资源
+        cleanup_pdh_resources()
+        # 3. 关闭主窗口
+        self.master.destroy() 
 
 
     def _setup_progress_bar(self, name):
         """
         为指定的指标设置进度条组件。
-        进度条由一个灰色的背景Label和一个动态宽度的填充Label组成，通过 place() 方法进行控制，
-        以确保像素级的准确对齐。
+        进度条由一个灰色的背景Label和一个动态宽度的填充Label组成。
         """
         # 创建一个Frame来容纳背景和填充，以便对齐
         frame = tk.Frame(self.master, height=self.BAR_HEIGHT, bg='SystemButtonFace')
         frame.pack(fill='x', padx=10)
         
-        # 灰色背景 (整体宽度, 使用 place 确保像素定位和宽度)
+        # 灰色背景 (整体宽度)
         bg_bar = tk.Label(frame, bg='#CCCCCC')
         bg_bar.place(x=0, y=0, width=self.BAR_WIDTH, height=self.BAR_HEIGHT) 
         
         # 颜色填充条 (动态宽度，初始宽度为 0)
         fill_bar = tk.Label(frame, bg='green', height=1)
-        # 使用 place() 保证它能叠加在 bg_bar 上，并可以独立控制宽度
         fill_bar.place(x=0, y=0, width=0, height=self.BAR_HEIGHT)
         
-        # 将组件存入实例变量，以便在 update_gpu_info 中访问和更新
+        # 将组件存入实例变量
         setattr(self, f'{name}_fill_bar', fill_bar)
         setattr(self, f'{name}_bg_bar', bg_bar)
 
@@ -193,9 +323,10 @@ class IntelArcMonitorApp:
     def _setup_gui(self):
         """
         配置GUI界面元素，并按照指定顺序设置标签和数据条。
+        【改动点 4/5】: 移除 GPU 综合指标，新增 Compute/Copy/3D 细分指标。
         """
-        # 调整窗口大小以容纳新增的两个网络指标、时钟和 Webui 状态标签
-        self.master.geometry("450x610") # <-- UPDATED SIZE
+        # 调整窗口大小以容纳新增的 GPU 细分指标
+        self.master.geometry("450x710") 
         
         # --- 新增：时钟标签 (1 秒刷新) ---
         self.clock_label = tk.Label(self.master, 
@@ -223,10 +354,20 @@ class IntelArcMonitorApp:
         self.shared_memory_label.pack(fill='x', padx=10, pady=(10, 0))
         self._setup_progress_bar('vram_system')
         
-        # 4. GPU 性能占用 (改为通用性能)
-        self.utilization_label = tk.Label(self.master, text="GPU 性能占用: N/A", font=('Arial', 14), anchor='w')
-        self.utilization_label.pack(fill='x', padx=10, pady=(10, 0))
-        self._setup_progress_bar('gpu_util')
+        # --- 4. 【改动点】GPU 核心引擎细分 (Compute -> Copy -> 3D) ---
+        for engine_type in CORE_ENGINES_TO_MONITOR:
+            cn_name = ENGINE_TRANSLATIONS.get(engine_type, engine_type)
+            # 使用 getattr 来动态创建标签和进度条变量
+            label_name = f'gpu_{engine_type.lower()}_label'
+            
+            # Label
+            label = tk.Label(self.master, text=f"GPU {cn_name}: N/A", font=('Arial', 14), anchor='w')
+            setattr(self, label_name, label)
+            label.pack(fill='x', padx=10, pady=(10, 0))
+            
+            # Progress Bar
+            self._setup_progress_bar(engine_type.lower())
+        # ------------------------------------------------------------------
 
         # 5. 专有显存占用
         self.memory_label = tk.Label(self.master, text="专有显存占用: N/A", font=('Arial', 14), anchor='w')
@@ -245,7 +386,7 @@ class IntelArcMonitorApp:
         self._setup_progress_bar('net_sent')
         # ---------------------------
 
-        # --- VRAM/VM 状态独立显示 (两行，不同颜色) ---
+        # --- VRAM/VM 状态独立显示 (三行) ---
         # 第一行：专有显存状态（用于确认程序运行）
         self.status_vram_label = tk.Label(self.master, text="状态: 监控正常", font=('Arial', 12, 'bold'), fg="green")
         self.status_vram_label.pack(pady=(5, 0)) # 上方留白
@@ -254,7 +395,7 @@ class IntelArcMonitorApp:
         self.status_vm_label = tk.Label(self.master, text="", font=('Arial', 12), fg="SystemButtonFace")
         self.status_vm_label.pack(pady=(0, 5)) # 下方留白
         
-        # 第三行：【新增】Webui 任务状态提示
+        # 第三行：Webui 任务状态提示
         self.status_webui_label = tk.Label(self.master, text="", font=('Arial', 12, 'bold'), fg="SystemButtonFace")
         self.status_webui_label.pack(pady=(5, 5)) # 上下方留白
 
@@ -264,7 +405,7 @@ class IntelArcMonitorApp:
 
     def _update_clock(self):
         """
-        【完善】独立更新时钟标签，1000ms (1秒) 刷新一次。
+        独立更新时钟标签，1000ms (1秒) 刷新一次。
         """
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.clock_label.config(text=f"当前时间: {current_time}")
@@ -327,45 +468,37 @@ class IntelArcMonitorApp:
             return None, None, None, None, None, None
 
 
-    def _get_gpu_stats_windows(self):
+    def _get_gpu_vram_stats_windows(self):
         """
         [Windows 平台专用]
-        通过 PowerShell 性能计数器获取 GPU **综合性能占用**和专有显存占用。
+        通过 PowerShell 性能计数器获取 GPU **专有显存占用**。
+        【改动点 5/5】: 移除 GPU 综合性能占用获取逻辑，只保留 VRAM 逻辑。
         """
         if self.os_type != "Windows":
-            raise NotImplementedError("非 Windows 操作系统，无法执行 PowerShell 命令。")
+            # 专有 VRAM 无法在非 Windows 上获取，返回 0
+            return 0.0, 0.0, 0.0 
             
         try:
-            # --- 1. 获取 GPU 综合性能占用 (接近任务管理器大纲值) ---
-            # 命令：获取所有 GPU 引擎的平均利用率 (3D, Compute, Copy, etc.)
-            util_cmd = r'powershell -ExecutionPolicy Bypass -Command "((Get-Counter \"\GPU Engine(*)\Utilization Percentage\").CounterSamples | Select-Object -ExpandProperty CookedValue | Measure-Object -Average).Average"'
-            result = subprocess.run(util_cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            
-            # 使用 or 0.0 处理 PowerShell 偶尔返回空值的情况
-            gpu_util = float(result.stdout.strip() or 0.0) 
-            
-            logger.debug(f"GPU Util (实际值): {gpu_util:.2f}%")
-            
-            # --- 2. 获取 专有显存占用 (Local Usage) ---
+            # --- 1. 获取 专有显存占用 (Local Usage) ---
+            # 此命令与原 sd-webui_monitor.py 中用于 VRAM 获取的命令相同
             mem_cmd = r'powershell -ExecutionPolicy Bypass -Command "((Get-Counter \"\GPU Process Memory(*)\Local Usage\").CounterSamples | Select-Object -ExpandProperty CookedValue | Measure-Object -Sum).Sum"'
             result = subprocess.run(mem_cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
             mem_used_bytes = float(result.stdout.strip() or 0)
             
             # 硬编码总显存 (Intel Arc A770 16GB)
-            mem_total_bytes = 16 * 1024**3
+            mem_total_bytes = INTEL_ARC_A770_TOTAL_BYTES
             
             # 计算专有显存占用百分比
             vram_local_percent = (mem_used_bytes / mem_total_bytes) * 100 if mem_total_bytes > 0 else 0
             
-            return gpu_util, mem_used_bytes, mem_total_bytes, vram_local_percent
+            return mem_used_bytes, mem_total_bytes, vram_local_percent
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"PowerShell 命令执行失败，错误代码: {e.returncode}，输出: {e.stderr.strip()}")
-            # 失败时返回 0 或 None，避免程序崩溃
-            return 0.0, 0.0, 16 * 1024**3, 0.0 # 返回 0.0% 和默认总显存
+        except subprocess.CalledCounterError as e:
+            logger.error(f"PowerShell VRAM 命令执行失败，错误代码: {e.returncode}，输出: {e.stderr.strip()}")
+            return 0.0, INTEL_ARC_A770_TOTAL_BYTES, 0.0 # 失败时返回 0.0% 和默认总显存
         except Exception as e:
-            logger.error(f"获取 GPU 数据时发生未知错误: {e}")
-            return 0.0, 0.0, 16 * 1024**3, 0.0
+            logger.error(f"获取 GPU VRAM 数据时发生未知错误: {e}")
+            return 0.0, INTEL_ARC_A770_TOTAL_BYTES, 0.0
 
 
     def _play_beep_alarm(self):
@@ -408,7 +541,7 @@ class IntelArcMonitorApp:
         # 确保百分比在 0 到 100 之间，防止计算错误
         percentage = max(0, min(100, percentage))
         
-        # 计算新的宽度：总宽度 * 百分比。由于 bg_bar 宽度是 BAR_WIDTH 像素，此处计算结果也是像素。
+        # 计算新的宽度：总宽度 * 百分比。
         new_width = int(self.BAR_WIDTH * (percentage / 100))
         # 获取颜色（基于 50%/75% 阈值）
         color = self._get_color(percentage)
@@ -454,12 +587,7 @@ class IntelArcMonitorApp:
 
     def _count_files_in_output_dir(self):
         """
-        【新增核心函数】
         获取当天 Webui 输出目录的文件数量。
-        
-        原理：动态构建当天的目录路径，然后计算该目录下非目录文件的数量。
-        
-        返回: 文件数量 (int)，如果目录不存在或读取失败则返回 0。
         """
         try:
             # 1. 获取当天日期的目录名 (格式: 2025-10-20)
@@ -486,13 +614,7 @@ class IntelArcMonitorApp:
 
     def _check_webui_generation_status(self, current_time):
         """
-        【新增】检查 Webui 文件数量是否在周期内增加，用于判断生成任务是否中断。
-        此方法在后台线程中调用，并更新自身的追踪变量。
-        
-        返回: 
-            is_webui_alert_active (bool): True 表示文件数量持续未增加，警报阈值已达到。
-            webui_status_msg (str): 详细的状态信息。
-            current_file_count (int): 当前的文件数量。
+        检查 Webui 文件数量是否在周期内增加，用于判断生成任务是否中断。
         """
         
         current_file_count = self._count_files_in_output_dir()
@@ -554,26 +676,29 @@ class IntelArcMonitorApp:
 
     def _fetch_all_data(self):
         """
-        【后台线程】负责所有阻塞式的数据获取工作，包括 GPU、系统和网络I/O。
+        【后台线程】负责所有阻塞式的数据获取工作，包括 GPU VRAM、GPU 引擎细分、系统和网络I/O。
         该方法返回一个包含所有数据的字典。
         """
         # 记录本次更新的时间
         current_time = time.time()
         
-        # --- 1. 获取 GPU 专有数据 ---
-        gpu_util, mem_used_bytes, mem_total_bytes, vram_local_percent = self._get_gpu_stats_windows()
+        # --- 1. 获取 GPU 专有 VRAM 数据 ---
+        mem_used_bytes, mem_total_bytes, vram_local_percent = self._get_gpu_vram_stats_windows()
 
-        # --- 2. 获取 系统数据 ---
+        # --- 2. 【新增】获取 GPU 核心引擎细分数据 ---
+        gpu_engine_util = get_core_gpu_utilization()
+
+        # --- 3. 获取 系统数据 ---
         cpu_percent, ram_used_gb, ram_total_gb, ram_percent, vram_system_used_bytes, vram_system_total_bytes = self._get_system_stats_psutil()
         
-        # --- 3. 获取网络 I/O 统计并计算速度 ---
+        # --- 4. 获取网络 I/O 统计并计算速度 ---
         net_io = psutil.net_io_counters()
         current_bytes_sent = net_io.bytes_sent
         current_bytes_recv = net_io.bytes_recv
         
         time_diff = current_time - self.last_update_time
         
-        # 最大的预期带宽（例如 1Gbps / 8 = 125 MB/s），用于进度条的百分比计算
+        # 最大的预期带宽（例如 100 MB/s），用于进度条的百分比计算
         MAX_BANDWIDTH_MBPS = 100 
         
         # 首次运行时 time_diff 可能为 0 或接近 0，或者 last_bytes 为 0，不进行计算或避免除以零
@@ -601,29 +726,29 @@ class IntelArcMonitorApp:
         self.last_net_bytes_recv = current_bytes_recv
         self.last_update_time = current_time
         
-        # --- 4. 【新增】检查 Webui 生成状态 ---
+        # --- 5. 检查 Webui 生成状态 ---
         is_webui_alert_active, webui_status_msg, current_file_count = self._check_webui_generation_status(current_time)
         # ------------------------------------
 
         # 格式化 GPU 显存数据
         mem_used_gb = mem_used_bytes / 1024**3
-        mem_total_gb = mem_total_bytes / 1024**3
         
         vram_system_used_gb = vram_system_used_bytes / 1024**3
         vram_system_total_gb = vram_system_total_bytes / 1024**3
 
         return {
-            'gpu_util': gpu_util, 'mem_used_bytes': mem_used_bytes, 'mem_total_bytes': mem_total_bytes, 
+            'gpu_engine_util': gpu_engine_util, # 【新增】
+            'mem_used_bytes': mem_used_bytes, 'mem_total_bytes': mem_total_bytes, 
             'vram_local_percent': vram_local_percent, 'cpu_percent': cpu_percent, 'ram_used_gb': ram_used_gb, 
             'ram_total_gb': ram_total_gb, 'ram_percent': ram_percent, 'vram_system_used_bytes': vram_system_used_bytes, 
             'vram_system_total_bytes': vram_system_total_bytes, 'vram_system_used_gb': vram_system_used_gb,
-            'vram_system_total_gb': vram_system_total_gb, 'mem_used_gb': mem_used_gb, 'mem_total_gb': mem_total_gb,
+            'vram_system_total_gb': vram_system_total_gb, 'mem_used_gb': mem_used_gb, 
             'recv_speed_mbps': recv_speed_mbps, 'sent_speed_mbps': sent_speed_mbps, 
             'recv_percent': recv_percent, 'sent_percent': sent_percent, 'MAX_BANDWIDTH_MBPS': MAX_BANDWIDTH_MBPS,
             'current_time': current_time,
-            'is_webui_alert_active': is_webui_alert_active, # 【新增】Webui 警报状态
-            'webui_status_msg': webui_status_msg, # 【新增】Webui 状态信息
-            'current_file_count': current_file_count, # 【新增】当前文件数量
+            'is_webui_alert_active': is_webui_alert_active, # Webui 警报状态
+            'webui_status_msg': webui_status_msg, # Webui 状态信息
+            'current_file_count': current_file_count, # 当前文件数量
             'error': None # 默认无错误
         }
 
@@ -679,14 +804,14 @@ class IntelArcMonitorApp:
             # 在错误情况下，所有 Label 都显示错误信息
             self.status_vram_label.config(text=f"错误: VRAM 数据获取失败", fg="red")
             self.status_vm_label.config(text=f"详细信息: {error}", fg="red")
-            self.status_webui_label.config(text=f"Webui 状态: 数据获取失败", fg="red") # <-- ADDED
+            self.status_webui_label.config(text=f"Webui 状态: 数据获取失败", fg="red")
             self.name_label.config(text="!!! 致命错误: 数据获取中断 !!!", fg="red")
             self.failure_count += 1
             self.log_count_label.config(text=f"总次数: {self.total_checks} | 正常: {self.success_count} | 警报触发: {self.failure_count}")
             return # 退出处理
 
         # 从字典中解包数据
-        gpu_util = fetched_data['gpu_util']
+        gpu_engine_util = fetched_data['gpu_engine_util'] # 【新增】
         mem_used_bytes = fetched_data['mem_used_bytes']
         mem_total_bytes = fetched_data['mem_total_bytes']
         vram_local_percent = fetched_data['vram_local_percent']
@@ -706,7 +831,7 @@ class IntelArcMonitorApp:
         MAX_BANDWIDTH_MBPS = fetched_data['MAX_BANDWIDTH_MBPS']
         current_time = fetched_data['current_time']
 
-        # 【新增】Webui 监控数据
+        # Webui 监控数据
         is_webui_alert_active = fetched_data['is_webui_alert_active']
         webui_status_msg = fetched_data['webui_status_msg']
         current_file_count = fetched_data['current_file_count']
@@ -739,24 +864,30 @@ class IntelArcMonitorApp:
              self._update_progress_bar('vram_system', 0)
              # 确保警报逻辑不依赖 None
              vram_system_used_bytes = 0
-             vram_system_used_gb = 0 # 确保在 VM 记录时不会因为 None 报错
+             vram_system_used_gb = 0 
         
-        # 4. GPU 性能占用
-        self.utilization_label.config(text=f"GPU 性能占用: {gpu_util:.2f}%")
-        self._update_progress_bar('gpu_util', gpu_util)
-        
+        # 4. 【改动点】更新 GPU 核心引擎细分
+        for engine_type in CORE_ENGINES_TO_MONITOR:
+             util_percent = gpu_engine_util.get(engine_type, 0.0)
+             cn_name = ENGINE_TRANSLATIONS.get(engine_type, engine_type)
+             
+             label_name = f'gpu_{engine_type.lower()}_label'
+             label = getattr(self, label_name)
+             
+             # 更新 Label 和 Progress Bar
+             label.config(text=f"GPU {cn_name}: {util_percent:.2f}%")
+             self._update_progress_bar(engine_type.lower(), util_percent)
+             
         # 5. 专有显存占用
         self.memory_label.config(text=f"专有显存占用: {mem_used_gb:.2f} GB / {mem_total_bytes/1024**3:.2f} GB ({vram_local_percent:.1f}%)")
         self._update_progress_bar('vram_local', vram_local_percent)
         
         # 6. 下载速度
         self.net_recv_label.config(text=f"下载速度: {recv_speed_mbps:.2f} MB/s (上限 {MAX_BANDWIDTH_MBPS} MB/s)")
-        # 进度条使用 recv_percent，颜色使用 _get_color()
         self._update_progress_bar('net_recv', recv_percent)
         
         # 7. 上传速度
         self.net_sent_label.config(text=f"上传速度: {sent_speed_mbps:.2f} MB/s (上限 {MAX_BANDWIDTH_MBPS} MB/s)")
-        # 进度条使用 sent_percent，颜色使用 _get_color()
         self._update_progress_bar('net_sent', sent_percent)
         
         # --- 检查警报条件 (仅 VRAM 和 Webui 触发铃声警报) ---
@@ -797,7 +928,7 @@ class IntelArcMonitorApp:
             self.status_vram_label.config(text=vram_status_msg, fg="red")
             # 第二行：虚拟内存风险提示
             self.status_vm_label.config(text=vm_status_msg, fg="red") 
-            # 第三行：【新增】Webui 任务状态提示
+            # 第三行：Webui 任务状态提示
             self.status_webui_label.config(text=webui_status_msg, fg="red")
             
             # 【核心逻辑 1: 延迟触发】如果警报未激活，则累加计数器 (VRAM/Webui 警报都走这个逻辑)
@@ -807,7 +938,7 @@ class IntelArcMonitorApp:
                 # 如果连续计数达到阈值，则启动警报 (VRAM 或 Webui 的警报都走这个逻辑)
                 if self.consecutive_warn_count >= self.WARN_COUNT_THRESHOLD:
                     
-                    # 【新增】：记录正式报警开始时间
+                    # 记录正式报警开始时间
                     if self.alarm_start_time is None:
                          self.alarm_start_time = time.time()
                          start_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.alarm_start_time))
@@ -856,7 +987,7 @@ class IntelArcMonitorApp:
                  # VM 正常，恢复默认颜色或绿色
                  self.status_vm_label.config(text=vm_status_msg, fg="SystemButtonFace") 
                  
-            # 第三行：【新增】Webui 任务状态提示
+            # 第三行：Webui 任务状态提示
             self.status_webui_label.config(text=webui_status_msg, fg="green") # 正常时显示绿色
 
             
@@ -887,9 +1018,12 @@ class IntelArcMonitorApp:
             
             # 记录正常日志
             if cpu_percent is not None:
-                 log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}% | Net Recv: {recv_speed_mbps:.2f} MB/s | Webui File Count: {current_file_count}"
+                 # 提取核心引擎利用率进行日志记录
+                 compute_util = gpu_engine_util.get("Compute", 0.0)
+                 copy_util = gpu_engine_util.get("Copy", 0.0)
+                 log_msg = f"状态正常 | GPU Compute: {compute_util:.2f}% | GPU Copy: {copy_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}% | Net Recv: {recv_speed_mbps:.2f} MB/s | Webui File Count: {current_file_count}"
             else:
-                 log_msg = f"状态正常 | GPU Util: {gpu_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败 | Webui File Count: {current_file_count}"
+                 log_msg = f"状态正常 | GPU 引擎数据: {gpu_engine_util} | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败 | Webui File Count: {current_file_count}"
             logger.info(log_msg)
             
         # --- 周期性 VM 使用量记录 ---
@@ -908,6 +1042,7 @@ if __name__ == '__main__':
         print("=" * 70)
         print("程序核心功能 1: 持续监控 VRAM 使用情况，确保 Webui 等任务持续运行 (VRAM >= 8GB)。")
         print("程序核心功能 2: 持续监控 Webui 输出目录文件数量，未增加则警报。")
+        print("核心指标替换: GPU 综合性能替换为核心引擎细分 (Compute, Copy, 3D)。")
         print("次要功能: 监控 VM 使用量，超过 80GB 时给出橙色风险提醒，并周期性记录其增长量。")
         print("【新增功能】：实时时钟显示 (1秒刷新) 和多线程数据采集 (避免UI卡顿)。")
         print("=" * 70)
