@@ -326,7 +326,7 @@ class IntelArcMonitorApp:
         【改动点 4/5】: 移除 GPU 综合指标，新增 Compute/Copy/3D 细分指标。
         """
         # 调整窗口大小以容纳新增的 GPU 细分指标
-        self.master.geometry("450x710") 
+        self.master.geometry("500x710") 
         
         # --- 新增：时钟标签 (1 秒刷新) ---
         self.clock_label = tk.Label(self.master, 
