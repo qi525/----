@@ -1,4 +1,4 @@
-# intel_arc_monitor_with_beep.py - 核心功能: 持续监控 VRAM 使用情况，确保 Webui 等任务持续运行
+# sd-webui_monitor.py - 核心功能: 持续监控 VRAM 使用情况，确保 Webui 等任务持续运行
 
 import tkinter as tk
 import time
@@ -53,13 +53,23 @@ def init_pdh_resources():
     """
     global PDH_AVAILABLE, QUERY_HANDLE, ENGINE_COUNTERS
     
+    # 防止重复初始化
+    if PDH_AVAILABLE:
+        logger.info("PDH 已经初始化，跳过。")
+        return
+
     if platform.system() != "Windows" or win32pdh is None:
         logger.warning("非 Windows 系统或缺少 pywin32 模块，PDH 监控不可用。")
         PDH_AVAILABLE = False
         return
 
     try:
+        # 1. 清理旧资源，以防万一
+        cleanup_pdh_resources()
+        
         QUERY_HANDLE = win32pdh.OpenQuery()
+        ENGINE_COUNTERS = {} # 清空计数器
+        
         # 通用 GPU 引擎利用率路径
         COUNTER_PATH = r"\GPU Engine(*)\Utilization Percentage" 
         counter_paths = win32pdh.ExpandCounterPath(COUNTER_PATH)
@@ -67,30 +77,40 @@ def init_pdh_resources():
         for path in counter_paths:
             try:
                 # 提取引擎类型，例如：luid_00000000_00000000_copy_3d
-                full_engine_key = path.split('(')[1].split(')')[0]
+                # 注意：这里我们使用完整的路径作为 key，例如：luid_00000000_00000000_copy_3d
                 counter_handle = win32pdh.AddCounter(QUERY_HANDLE, path)
+                # 使用路径的实例名作为 key
+                full_engine_key = path.split('(')[1].split(')')[0]
                 ENGINE_COUNTERS[full_engine_key] = counter_handle
             except Exception as e:
-                logger.warning(f"添加计数器失败: {path}。错误: {e}")
-                
+                # 警告：此处的错误可能是计数器实例不存在
+                # logger.warning(f"添加计数器失败: {path}。错误: {e}")
+                pass # 忽略单个计数器添加失败
+
         if not ENGINE_COUNTERS:
             logger.error("未找到任何 GPU 引擎性能计数器实例，PDH 初始化失败。")
             PDH_AVAILABLE = False
+            # 失败后关闭句柄
+            cleanup_pdh_resources()
         else:
             # 第一次采集数据，防止 PDH_CALC_COUNTER_VALUE_FIRST 错误
             win32pdh.CollectQueryData(QUERY_HANDLE)
             PDH_AVAILABLE = True
-            logger.info(f"PDH 成功初始化，找到 {len(ENGINE_COUNTERS)} 个 GPU 引擎计数器。")
+            logger.success(f"PDH 成功初始化/恢复，找到 {len(ENGINE_COUNTERS)} 个 GPU 引擎计数器。")
             
     except Exception as e:
         PDH_AVAILABLE = False
         logger.error(f"PDH 初始化失败。错误: {e}")
+        # 确保失败后句柄被关闭
+        cleanup_pdh_resources()
 
 def get_core_gpu_utilization():
     """
     获取 GPU 核心引擎 (Compute, Copy, 3D) 的聚合利用率。
     此函数在后台线程中被调用。
     """
+    global PDH_AVAILABLE
+    
     if not PDH_AVAILABLE:
         # PDH 不可用时返回默认 0 值
         return {engine: 0 for engine in CORE_ENGINES_TO_MONITOR}
@@ -109,6 +129,7 @@ def get_core_gpu_utilization():
                 if util_percent > 0:
                     # 提取引擎类型 (例如：luid_..._3d 提取 3D)
                     parts = full_engine_key.split('_')
+                    # 尝试从最后一个部分获取引擎类型
                     engine_type = parts[-1] 
                     
                     # 仅关注核心引擎
@@ -117,15 +138,25 @@ def get_core_gpu_utilization():
                         core_engine_utilization[engine_type] += util_percent
                         
             except Exception as e:
-                # 忽略第一次采集数据时可能出现的 PDH_CALC_COUNTER_VALUE_FIRST
+                # 忽略第一次采集数据时可能出现的 PDH_CALC_COUNTER_VALUE_FIRST 或 PDH_NO_DATA
                 if hasattr(e, 'winerror') and e.winerror in [win32pdh.PDH_NO_DATA, win32pdh.PDH_CALC_COUNTER_VALUE_FIRST]:
                      continue
+                
+                # 如果是其他 PDH 错误（如句柄失效），则记录并强制禁用 PDH 
+                if hasattr(e, 'winerror'):
+                    logger.error(f"PDH 计数器值获取失败，错误代码: {e.winerror}。强制 PDH_AVAILABLE=False 触发重试。")
+                    PDH_AVAILABLE = False
+                    # 必须跳出循环，因为句柄已失效
+                    break 
+                
                 logger.warning(f"获取 {full_engine_key} 计数器值失败: {e}")
                 
         return core_engine_utilization
         
     except Exception as e:
-        logger.error(f"PDH 数据收集失败: {e}")
+        # 捕获 CollectQueryData 错误（例如句柄已失效）
+        logger.error(f"PDH CollectQueryData 失败: {e}。强制 PDH_AVAILABLE=False 触发重试。")
+        PDH_AVAILABLE = False
         # 失败时返回 0，确保程序不中断
         return {engine: 0.0 for engine in CORE_ENGINES_TO_MONITOR}
 
@@ -134,13 +165,14 @@ def cleanup_pdh_resources():
     关闭全局 PDH 查询句柄，释放资源。
     【改动点 2/5】: 整合 PDH 清理逻辑。
     """
-    global QUERY_HANDLE, PDH_AVAILABLE
+    global QUERY_HANDLE, PDH_AVAILABLE, ENGINE_COUNTERS
     
-    if PDH_AVAILABLE and QUERY_HANDLE:
+    if QUERY_HANDLE:
          try:
              win32pdh.CloseQuery(QUERY_HANDLE)
              QUERY_HANDLE = None
-             PDH_AVAILABLE = False
+             ENGINE_COUNTERS = {}
+             # 仅清理资源，不影响 PDH_AVAILABLE 的状态判断
              logger.info("PDH 查询资源已关闭。")
          except Exception as e:
              logger.error(f"关闭 PDH 查询失败: {e}")
@@ -180,6 +212,9 @@ class IntelArcMonitorApp:
     # 监控更新间隔 (毫秒)
     UPDATE_INTERVAL_MS = 1500  # 1.5秒
     
+    # 【新增】PDH 重试冷却时间 (秒)
+    PDH_RETRY_COOLDOWN_SECONDS = 60 
+
     # 自定义警报声音文件
     ALARM_WAV_FILE = "7 you.wav"
     
@@ -208,6 +243,9 @@ class IntelArcMonitorApp:
         
         # 【新增】: 初始化 PDH 资源
         init_pdh_resources()
+        
+        # 【新增】：PDH 重试计数器
+        self.pdh_retry_timestamp = 0.0 # 上次尝试重初始化的时间戳
 
         # 初始化计数器
         self.total_checks = 0
@@ -673,7 +711,34 @@ class IntelArcMonitorApp:
         # 返回当前的警报状态、消息和文件数
         return is_webui_alert_active, webui_status_msg, current_file_count
 
-
+    def _try_reinitialize_pdh(self, current_time):
+        """
+        【新增方法】尝试在冷却时间后重新初始化 PDH 资源。
+        此函数在后台线程中被调用。
+        """
+        global PDH_AVAILABLE
+        
+        # 检查是否处于冷却期
+        time_since_last_retry = current_time - self.pdh_retry_timestamp
+        
+        if time_since_last_retry >= self.PDH_RETRY_COOLDOWN_SECONDS:
+            logger.warning(f"PDH 监控已中断。尝试重新初始化 PDH 资源 (距离上次重试 {time_since_last_retry:.1f} 秒)...")
+            # 更新重试时间戳
+            self.pdh_retry_timestamp = current_time
+            
+            # 1. 强制清理 (以防万一)
+            cleanup_pdh_resources()
+            
+            # 2. 尝试重新初始化
+            init_pdh_resources()
+            
+            if PDH_AVAILABLE:
+                logger.success("PDH 重新初始化成功。GPU 引擎细分监控已恢复。")
+            else:
+                logger.error("PDH 重新初始化失败。将等待下一个冷却周期重试。")
+        else:
+            logger.warning(f"PDH 监控已中断，但仍在冷却期内 ({time_since_last_retry:.1f}/{self.PDH_RETRY_COOLDOWN_SECONDS} 秒)。跳过本次重试。")
+    
     def _fetch_all_data(self):
         """
         【后台线程】负责所有阻塞式的数据获取工作，包括 GPU VRAM、GPU 引擎细分、系统和网络I/O。
@@ -682,10 +747,16 @@ class IntelArcMonitorApp:
         # 记录本次更新的时间
         current_time = time.time()
         
+        # --- 0. 检查并尝试恢复 PDH 资源 ---
+        global PDH_AVAILABLE
+        if not PDH_AVAILABLE and self.os_type == "Windows":
+             self._try_reinitialize_pdh(current_time)
+
         # --- 1. 获取 GPU 专有 VRAM 数据 ---
         mem_used_bytes, mem_total_bytes, vram_local_percent = self._get_gpu_vram_stats_windows()
 
         # --- 2. 【新增】获取 GPU 核心引擎细分数据 ---
+        # 如果 PDH 仍不可用，这里将返回 0 值
         gpu_engine_util = get_core_gpu_utilization()
 
         # --- 3. 获取 系统数据 ---
@@ -793,6 +864,7 @@ class IntelArcMonitorApp:
         """
         【主线程】负责处理从后台获取的数据，更新UI、执行警报逻辑和日志记录。
         """
+        global PDH_AVAILABLE
         
         if error or fetched_data is None:
             # 数据获取失败，处理错误情况
@@ -874,9 +946,14 @@ class IntelArcMonitorApp:
              label_name = f'gpu_{engine_type.lower()}_label'
              label = getattr(self, label_name)
              
-             # 更新 Label 和 Progress Bar
-             label.config(text=f"GPU {cn_name}: {util_percent:.2f}%")
-             self._update_progress_bar(engine_type.lower(), util_percent)
+             # 如果 PDH 不可用，在 UI 上也给出提示
+             if not PDH_AVAILABLE and self.os_type == "Windows":
+                 label.config(text=f"GPU {cn_name}: N/A (监控中断)")
+                 self._update_progress_bar(engine_type.lower(), 0)
+             else:
+                 # 更新 Label 和 Progress Bar
+                 label.config(text=f"GPU {cn_name}: {util_percent:.2f}%")
+                 self._update_progress_bar(engine_type.lower(), util_percent)
              
         # 5. 专有显存占用
         self.memory_label.config(text=f"专有显存占用: {mem_used_gb:.2f} GB / {mem_total_bytes/1024**3:.2f} GB ({vram_local_percent:.1f}%)")
@@ -1021,7 +1098,11 @@ class IntelArcMonitorApp:
                  # 提取核心引擎利用率进行日志记录
                  compute_util = gpu_engine_util.get("Compute", 0.0)
                  copy_util = gpu_engine_util.get("Copy", 0.0)
-                 log_msg = f"状态正常 | GPU Compute: {compute_util:.2f}% | GPU Copy: {copy_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}% | Net Recv: {recv_speed_mbps:.2f} MB/s | Webui File Count: {current_file_count}"
+                 
+                 # PDH 不可用时，在日志中也要体现
+                 pdh_status = "正常" if PDH_AVAILABLE else "PDH 中断"
+                 
+                 log_msg = f"状态正常 ({pdh_status}) | GPU Compute: {compute_util:.2f}% | GPU Copy: {copy_util:.2f}% | VRAM: {mem_used_gb:.2f} GB | VM: {vram_system_used_gb:.1f} GB | CPU Util: {cpu_percent:.1f}% | Net Recv: {recv_speed_mbps:.2f} MB/s | Webui File Count: {current_file_count}"
             else:
                  log_msg = f"状态正常 | GPU 引擎数据: {gpu_engine_util} | VRAM: {mem_used_gb:.2f} GB | 系统数据获取失败 | Webui File Count: {current_file_count}"
             logger.info(log_msg)
@@ -1045,6 +1126,7 @@ if __name__ == '__main__':
         print("核心指标替换: GPU 综合性能替换为核心引擎细分 (Compute, Copy, 3D)。")
         print("次要功能: 监控 VM 使用量，超过 80GB 时给出橙色风险提醒，并周期性记录其增长量。")
         print("【新增功能】：实时时钟显示 (1秒刷新) 和多线程数据采集 (避免UI卡顿)。")
+        print("【优化功能】：PDH GPU 引擎细分监控中断时，自动进行冷却后重试。")
         print("=" * 70)
         app = IntelArcMonitorApp(root)
         root.mainloop()
