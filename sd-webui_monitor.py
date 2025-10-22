@@ -1,5 +1,3 @@
-# sd-webui_monitor.py - 核心功能: 持续监控 VRAM 使用情况，确保 Webui 等任务持续运行
-
 import tkinter as tk
 import time
 import sys
@@ -215,8 +213,8 @@ class IntelArcMonitorApp:
     # 【新增】PDH 重试冷却时间 (秒)
     PDH_RETRY_COOLDOWN_SECONDS = 60 
 
-    # 自定义警报声音文件
-    ALARM_WAV_FILE = "7 you.wav"
+    # 自定义警报声音文件名 (注意：这里只是文件名，路径在 __init__ 中处理)
+    ALARM_WAV_FILENAME = "7 you.wav" # <-- CHANGE 1/2: 改为仅文件名
     
     # 数据条尺寸常量
     BAR_WIDTH = 250
@@ -288,6 +286,13 @@ class IntelArcMonitorApp:
         self.WEBUI_WARN_CYCLE_THRESHOLD = 2 
         # ----------------------------------------------------
 
+        # 【核心改动点 1/1】：计算警报文件的绝对路径
+        script_dir = os.path.abspath(os.path.dirname(__file__))
+        self.ALARM_WAV_FILE_PATH = os.path.join(script_dir, self.ALARM_WAV_FILENAME)
+        logger.info(f"警报文件预设路径: {self.ALARM_WAV_FILE_PATH}")
+        # ----------------------------------------------------
+
+
         # 创建并配置tkinter界面
         self._setup_gui()
         
@@ -303,10 +308,11 @@ class IntelArcMonitorApp:
         if self.os_type == "Windows":
             try:
                 self.playback = Playback()
-                self.playback.load_file(self.ALARM_WAV_FILE)
-                logger.success(f"警报文件 '{self.ALARM_WAV_FILE}' 加载成功。")
+                # CHANGE 2/2: 使用绝对路径加载文件
+                self.playback.load_file(self.ALARM_WAV_FILE_PATH) 
+                logger.success(f"警报文件 '{self.ALARM_WAV_FILENAME}' 加载成功。")
             except Exception as e:
-                logger.error(f"初始化或加载警报文件失败（just_playback）：{e}。将使用系统默认警报音作为回退。")
+                logger.error(f"初始化或加载警报文件失败（just_playback）。请检查文件是否存在: {self.ALARM_WAV_FILE_PATH}。错误: {e}。将使用系统默认警报音作为回退。")
         
         logger.info("Intel Arc GPU 监控应用启动成功。")
 
@@ -558,7 +564,7 @@ class IntelArcMonitorApp:
                     # 播放预加载的文件 (非阻塞，恢复单次播放)
                     self.playback.play()
                 except Exception as e:
-                    logger.error(f"播放自定义声音文件 '{self.ALARM_WAV_FILE}' 失败（just_playback）：{e}。")
+                    logger.error(f"播放自定义声音文件 '{self.ALARM_WAV_FILENAME}' 失败（just_playback）：{e}。")
                     # 播放失败时，回退到系统警报音
                     winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
             else:
@@ -1127,6 +1133,7 @@ if __name__ == '__main__':
         print("次要功能: 监控 VM 使用量，超过 80GB 时给出橙色风险提醒，并周期性记录其增长量。")
         print("【新增功能】：实时时钟显示 (1秒刷新) 和多线程数据采集 (避免UI卡顿)。")
         print("【优化功能】：PDH GPU 引擎细分监控中断时，自动进行冷却后重试。")
+        print("【本次优化】：警报声音文件路径自适应，确保 CMD 启动时不报错。") # <-- 补充日志
         print("=" * 70)
         app = IntelArcMonitorApp(root)
         root.mainloop()
