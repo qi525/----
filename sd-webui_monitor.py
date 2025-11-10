@@ -22,6 +22,9 @@ except ImportError:
     win32pdh = None
 
 
+# TODO 功能选择里面添加给转化后的图片添加前缀“创建文件时间的前缀”   2025-10-20---图片名称.jpg/webp
+
+
 # --- Loguru 配置 (完美的日志输出) ---
 logger.remove()
 # 完美的日志输出格式
