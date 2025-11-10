@@ -3,7 +3,7 @@ import time
 import sys
 import subprocess
 import psutil # <-- 用于获取系统CPU和内存信息
-from just_playback import Playback
+from playsound3 import playsound # @@ 5-5,1/+1 @@
 import platform
 from loguru import logger
 import datetime # <-- 【新增】用于获取实时时间
@@ -231,7 +231,7 @@ class IntelArcMonitorApp:
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2) 
         
         # just_playback 播放器对象
-        self.playback = None 
+        self.playback = None # @@ 212-212,+0/-1 @@
         
         self.master = master
         master.title("Intel Arc A770 实时监控 (GPU 核心引擎细分增强)")
@@ -308,14 +308,14 @@ class IntelArcMonitorApp:
         master.protocol("WM_DELETE_WINDOW", self.on_closing) 
 
         # 【重要】：初始化播放器并预加载 WAV 文件
-        if self.os_type == "Windows":
+        if self.os_type == "Windows": # @@ 306-313,2/+0 @@
             try:
-                self.playback = Playback()
-                # CHANGE 2/2: 使用绝对路径加载文件
-                self.playback.load_file(self.ALARM_WAV_FILE_PATH) 
-                logger.success(f"警报文件 '{self.ALARM_WAV_FILENAME}' 加载成功。")
+                # 播放器初始化被移除，因为 playsound3 不需要预加载
+                # self.playback = Playback() # 移除初始化
+                # self.playback.load_file(self.ALARM_WAV_FILE_PATH) # 移除预加载
+                logger.success(f"警报文件 '{self.ALARM_WAV_FILENAME}' 路径已设置。")
             except Exception as e:
-                logger.error(f"初始化或加载警报文件失败（just_playback）。请检查文件是否存在: {self.ALARM_WAV_FILE_PATH}。错误: {e}。将使用系统默认警报音作为回退。")
+                logger.error(f"设置警报文件路径失败（playsound3）：{e}。将使用系统默认警报音作为回退。")
         
         logger.info("Intel Arc GPU 监控应用启动成功。")
 
@@ -550,28 +550,25 @@ class IntelArcMonitorApp:
 
     def _play_beep_alarm(self):
         """
-        播放自定义 WAV 文件（使用 just_playback）作为警报。
+        播放自定义 WAV 文件（使用 playsound3）作为警报。
         """
         # 【新增】：记录并打印本次播放是第几次循环
         self.playback_count += 1
         logger.info(f"尝试播放声音警报 (第 {self.playback_count} 次循环)...")
         if self.os_type == "Windows":
-            if self.playback:
-                try:
-                    # 确保停止上一次的播放（防止警报堆叠）
-                    if self.playback.active:
-                        self.playback.stop() 
-                    
-                    # 重置播放位置到文件开头，确保每次都完整播放
-                    self.playback.seek(0) 
-                    # 播放预加载的文件 (非阻塞，恢复单次播放)
-                    self.playback.play()
-                except Exception as e:
-                    logger.error(f"播放自定义声音文件 '{self.ALARM_WAV_FILENAME}' 失败（just_playback）：{e}。")
-                    # 播放失败时，回退到系统警报音
-                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            else:
-                # 如果播放器初始化失败，回退到系统警报音
+            # 这里的 self.playback 实际存储的是 playsound3.Sound 对象
+            try:
+                # 1. 确保停止上一次的播放（防止警报堆叠）
+                if self.playback and self.playback.is_alive(): # @@ 661-662,+0/-1 @@
+                    self.playback.stop() 
+                
+                # 2. 播放预加载的文件 (非阻塞，playsound3 是一步到位)
+                # playsound3.playsound(path, block=False) 返回一个 Sound 对象
+                # 将 Sound 对象存到 self.playback
+                self.playback = playsound(self.ALARM_WAV_FILE_PATH, block=False) # @@ 665-667,+1/-2 @@
+            except Exception as e:
+                logger.error(f"播放自定义声音文件 '{self.ALARM_WAV_FILENAME}' 失败（playsound3）：{e}。") # @@ 668-669,+0/-1 @@
+                # 播放失败时，回退到系统警报音
                 winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
         else:
              # 非 Windows 系统备用方案
@@ -1052,8 +1049,8 @@ class IntelArcMonitorApp:
                           
                      logger.warning(f"中断警报条件满足 ({', '.join(current_warn_parts)})，连续计数: {self.consecutive_warn_count}/{self.WARN_COUNT_THRESHOLD}。未达警报阈值。")
                      
-            # 【警报循环播放 Bug 逻辑】：如果警报已启动 (is_alarm_active=True)，但音乐已停止 (playback.active=False)，则重新启动音乐。
-            elif self.is_alarm_active and self.playback and not self.playback.active:
+            # 【警报循环播放 Bug 逻辑】：如果警报已启动 (is_alarm_active=True)，但音乐已停止 (playback.is_alive()=False)，则重新启动音乐。
+            elif self.is_alarm_active and self.playback and not self.playback.is_alive(): # @@ 1073-1073,+0/-1 @@
                  # 播放计数和日志打印已在 _play_beep_alarm 内部处理
                  self._play_beep_alarm()
                      
@@ -1090,7 +1087,7 @@ class IntelArcMonitorApp:
                      self.playback_count = 0
                 
                 # 警报解除时，停止播放器（包括循环播放的音乐）
-                if self.playback and self.playback.active:
+                if self.playback and self.playback.is_alive(): # @@ 1118-1118,+0/-1 @@
                     self.playback.stop()
                     logger.info("中断警报条件解除，已强制停止警报音乐。")
                     
@@ -1137,6 +1134,7 @@ if __name__ == '__main__':
         print("【新增功能】：实时时钟显示 (1秒刷新) 和多线程数据采集 (避免UI卡顿)。")
         print("【优化功能】：PDH GPU 引擎细分监控中断时，自动进行冷却后重试。")
         print("【本次优化】：警报声音文件路径自适应，确保 CMD 启动时不报错。") # <-- 补充日志
+        print("【本次优化】：将 just_playback 替换为 playsound3 实现更稳定的跨平台播放控制。") # @@ 1162-1162,+1/-0 @@
         print("=" * 70)
         app = IntelArcMonitorApp(root)
         root.mainloop()
